@@ -1,0 +1,6 @@
+bin
+obj
+error.log
+nxweb.pid
+nxweb.layout
+html/benchmark
