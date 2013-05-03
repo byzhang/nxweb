@@ -39,18 +39,17 @@ static nxweb_result subreq_on_request(nxweb_http_server_connection* conn, nxweb_
   return NXWEB_OK;
 }
 
-NXWEB_HANDLER(subreq, "/subreq", .on_request=subreq_on_request,
-        .flags=NXWEB_HANDLE_ANY, .priority=1000);
+nxweb_handler subreq_handler={ .on_request=subreq_on_request, .flags=NXWEB_HANDLE_ANY };
 
 int nxt_parse(nxt_context* ctx, const char* uri, char* buf, int buf_len);
 
 static int tmpl_load(nxt_context* ctx, const char* uri, nxt_file* dst_file, nxt_block* dst_block) { // function to make subrequests
   if (dst_block) {
-    nxweb_log_error("including file %s", uri);
+    nxweb_log_info("including file %s", uri);
     nxt_block_append_value(ctx, dst_block, "{% This is included file %}", sizeof("{% This is included file %}")-1, 0);
   }
   else {
-    nxweb_log_error("loading template from %s", uri);
+    nxweb_log_info("loading template from %s", uri);
     if (!strcmp(uri, "base")) {
       const char* tmpl_src=" {%block _top_%}{%raw%}{{{{%%%%}}}}{%endraw%}{% include aaa %}AAA-YYY{%block header%}Header{%endblock%} bye...{% endblock %}{% block title %}New Title{% endblock %}";
       char* tmpl=nxb_copy_obj(ctx->nxb, tmpl_src, strlen(tmpl_src)+1);
@@ -70,7 +69,7 @@ static nxweb_result tmpl_on_request(nxweb_http_server_connection* conn, nxweb_ht
   const char* tmpl="{% extends \"ttt\"%} {% block title %}The Very {% parent %}{% endblock %}";
   tmpl=nxb_copy_obj(req->nxb, tmpl, strlen(tmpl)+1);
   nxt_context ctx;
-  nxt_init(&ctx, req->nxb, tmpl_load);
+  nxt_init(&ctx, req->nxb, tmpl_load, (nxe_data)0);
   nxt_parse(&ctx, req->uri, (char*)tmpl, strlen(tmpl));
   nxt_merge(&ctx);
   resp->content=nxt_serialize(&ctx);
@@ -79,8 +78,7 @@ static nxweb_result tmpl_on_request(nxweb_http_server_connection* conn, nxweb_ht
   return NXWEB_OK;
 }
 
-NXWEB_HANDLER(tmpl, "/tmpl", .on_request=tmpl_on_request,
-        .flags=NXWEB_HANDLE_ANY, .priority=1000);
+nxweb_handler tmpl_handler={ .on_request=tmpl_on_request, .flags=NXWEB_HANDLE_ANY };
 
 
 static nxweb_result curtime_on_request(nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
@@ -104,18 +102,18 @@ static nxweb_result curtime_on_request(nxweb_http_server_connection* conn, nxweb
 
 static nxweb_result curtime_generate_cache_key(nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
   if (!req->get_method || req->content_length) return NXWEB_OK; // do not cache POST requests, etc.
-  char* key=nxb_alloc_obj(req->nxb, strlen(req->uri)+2);
-  *key=' ';
-  strcpy(key+1, req->uri);
-  resp->cache_key=key;
-  resp->cache_key_root_len=1;
+  _nxb_append_encode_file_path(req->nxb, req->host);
+  if (conn->secure) nxb_append_str(req->nxb, "_s");
+  _nxb_append_encode_file_path(req->nxb, req->uri);
+  nxb_append_char(req->nxb, '\0');
+  resp->cache_key=nxb_finish_stream(req->nxb, 0);
   return NXWEB_OK;
 }
 
-NXWEB_HANDLER(curtime, "/curtime", .on_request=curtime_on_request,
+nxweb_handler curtime_handler={ .on_request=curtime_on_request,
         .on_generate_cache_key=curtime_generate_cache_key,
-        .flags=NXWEB_HANDLE_GET|NXWEB_PARSE_PARAMETERS, .priority=1000,
-        .filters={&file_cache_filter}, .file_cache_dir="www/cache/curtime");
+        .flags=NXWEB_HANDLE_GET|NXWEB_PARSE_PARAMETERS };
+
 
 #ifdef WITH_IMAGEMAGICK
 
@@ -125,8 +123,7 @@ static nxweb_result captcha_on_request(nxweb_http_server_connection* conn, nxweb
   return NXWEB_OK;
 }
 
-NXWEB_HANDLER(captcha, "/captcha", .on_request=captcha_on_request,
-        .flags=NXWEB_HANDLE_GET|NXWEB_PARSE_PARAMETERS, .priority=1000,
-        .filters={&draw_filter}, .font="www/fonts/Sansation/Sansation_Bold.ttf");
+nxweb_handler captcha_handler={ .on_request=captcha_on_request,
+        .flags=NXWEB_HANDLE_GET|NXWEB_PARSE_PARAMETERS };
 
 #endif

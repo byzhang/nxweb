@@ -162,11 +162,7 @@ static const nxe_istream_class rbuffer_data_out_class={.do_write=rbuffer_data_ou
 
 void nxd_rbuffer_init(nxd_rbuffer* rb, void* buf, int size) {
   memset(rb, 0, sizeof(nxd_rbuffer));
-  rb->read_ptr=
-  rb->start_ptr=
-  rb->write_ptr=buf;
-  rb->end_ptr=buf+size;
-  rb->last_write=0;
+  nxd_rbuffer_init_ptr(rb, buf, size);
   rb->data_out.super.cls.is_cls=&rbuffer_data_out_class;
   rb->data_in.super.cls.os_cls=&rbuffer_data_in_class;
   rb->data_out.evt.cls=NXE_EV_STREAM;
@@ -179,9 +175,11 @@ void nxd_rbuffer_read(nxd_rbuffer* rb, int size) {
     assert(rb->read_ptr <= rb->end_ptr);
     if (rb->read_ptr >= rb->end_ptr) rb->read_ptr=rb->start_ptr;
     rb->last_write=0;
-    if (rb->data_in.super.loop) nxe_ostream_set_ready(rb->data_in.super.loop, &rb->data_in);
-    else rb->data_in.ready=1;
-    if (rb->read_ptr==rb->write_ptr) { // nxd_rbuffer_is_empty(rb)
+    if (!rb->eof) {
+      if (rb->data_in.super.loop) nxe_ostream_set_ready(rb->data_in.super.loop, &rb->data_in);
+      else rb->data_in.ready=1;
+    }
+    if (rb->read_ptr==rb->write_ptr && !rb->eof) { // nxd_rbuffer_is_empty(rb)
       //nxweb_log_error("rb->read_ptr==rb->write_ptr && !rb->eof => closing rb[%p].data_out", rb);
       if (rb->data_out.super.loop) nxe_istream_unset_ready(&rb->data_out);
       else rb->data_out.ready=0;

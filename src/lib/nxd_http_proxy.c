@@ -1,18 +1,18 @@
 /*
  * Copyright (c) 2011-2012 Yaroslav Stavnichiy <yarosla@gmail.com>
- * 
+ *
  * This file is part of NXWEB.
- * 
+ *
  * NXWEB is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License
  * as published by the Free Software Foundation, either version 3
  * of the License, or (at your option) any later version.
- * 
+ *
  * NXWEB is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU Lesser General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU Lesser General Public
  * License along with NXWEB. If not, see <http://www.gnu.org/licenses/>.
  */
@@ -93,6 +93,7 @@ int nxd_http_proxy_connect(nxd_http_proxy* hpx, nxe_loop* loop, const char* host
   nxe_subscribe(loop, &hpx->sock.fs.data_error, &hpx->hcp.data_error);
   nxe_connect_streams(loop, &hpx->sock.fs.data_is, &hpx->hcp.data_in);
   nxe_connect_streams(loop, &hpx->hcp.data_out, &hpx->sock.fs.data_os);
+  hpx->uid=nxweb_generate_unique_id();
   return 0;
 }
 
@@ -128,9 +129,34 @@ void nxd_http_proxy_pool_init(nxd_http_proxy_pool* pp, nxe_loop* loop, nxp_pool*
   pp->saddr=saddr;
   pp->first=0;
   pp->last=0;
+  time_t *samples=pp->backend_time_delta;
+  int i;
+  for (i=0; i<NXD_HTTP_PROXY_POOL_TIME_DELTA_SAMPLES; i++) {
+    samples[i]=NXD_HTTP_PROXY_POOL_TIME_DELTA_NO_VALUE;
+  }
   pp->free_pool=nxp_create(sizeof(nxd_http_proxy), NXD_FREE_PROXY_POOL_INITIAL_SIZE);
   nxe_init_subscriber(&pp->gc_sub, &gc_sub_class);
   nxe_subscribe(loop, &loop->gc_pub, &pp->gc_sub);
+}
+
+void nxd_http_proxy_pool_report_backend_time_delta(nxd_http_proxy_pool* pp, time_t delta) {
+  pp->backend_time_delta[pp->backend_time_delta_idx]=delta;
+  pp->backend_time_delta_idx=(pp->backend_time_delta_idx+1)%NXD_HTTP_PROXY_POOL_TIME_DELTA_SAMPLES;
+}
+
+time_t nxd_http_proxy_pool_get_backend_time_delta(nxd_http_proxy_pool* pp) {
+  time_t *samples=pp->backend_time_delta;
+  int i, cnt=0;
+  time_t sum=0;
+  for (i=0; i<NXD_HTTP_PROXY_POOL_TIME_DELTA_SAMPLES; i++) {
+    if (samples[i]!=NXD_HTTP_PROXY_POOL_TIME_DELTA_NO_VALUE) {
+      sum+=samples[i];
+      cnt++;
+    }
+  }
+  if (!cnt) return 0;
+  time_t avg=(sum+cnt/2)/cnt;
+  return avg;
 }
 
 nxd_http_proxy* nxd_http_proxy_pool_connect(nxd_http_proxy_pool* pp) {

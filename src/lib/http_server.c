@@ -36,7 +36,9 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 
-struct nxweb_server_config nxweb_server_config;
+struct nxweb_server_config nxweb_server_config={
+  .shutdown_timeout=5
+};
 
 static pthread_t main_thread_id=0;
 
@@ -67,68 +69,87 @@ int nxweb_select_handler(nxweb_http_server_connection* conn, nxweb_http_request*
   conn->handler=handler;
   conn->handler_param=handler_param;
   // since nxweb_select_handler() could be called several times
-  // make sure the following fields returned to initial state:
-  resp->cache_key=0;
-  resp->last_modified=0;
-  if (resp->sendfile_info.st_ino) memset(&resp->sendfile_info, 0, sizeof(resp->sendfile_info));
+  // make sure all changed fields returned to initial state
+  time_t if_modified_since_original=req->if_modified_since; // save original value
+  const char* uri_original=req->uri;
 
-  if (handler->num_filters) {
+  const int num_filters=handler->num_filters;
+  nxweb_filter** filters=handler->filters;
+  if (num_filters) {
     // init filters
     int i;
     nxweb_filter* filter;
-    for (i=0; i<handler->num_filters; i++) {
-      filter=handler->filters[i];
+    nxweb_filter_data* fdata;
+    for (i=0; i<num_filters; i++) {
+      filter=filters[i];
       assert(filter->init);
-      req->filter_data[i]=filter->init(conn, req, resp);
+      req->filter_data[i]=filter->init(filter, conn, req, resp);
     }
     // let filters decode uri
     const char* uri=req->uri;
-    for (i=handler->num_filters-1; i>=0; i--) {
-      if (req->filter_data[i]->bypass) continue;
-      filter=handler->filters[i];
+    for (i=num_filters-1; i>=0; i--) {
+      fdata=req->filter_data[i];
+      if (!fdata || fdata->bypass) continue;
+      filter=filters[i];
       if (!filter->decode_uri) continue;
-      uri=filter->decode_uri(conn, req, resp, req->filter_data[i], uri);
+      uri=filter->decode_uri(filter, conn, req, resp, req->filter_data[i], uri); // should return the same uri if unchanged
     }
-    req->uri=uri;
-    assert(!handler->prefix_len || nxweb_url_prefix_match(req->uri, handler->prefix, handler->prefix_len)); // ensure it still matches
+    if (req->uri!=uri) { // uri changed
+      if (handler->prefix_len && !nxweb_url_prefix_match(uri, strlen(uri), handler->prefix, handler->prefix_len)) { // ensure it still matches
+        nxweb_log_error("uri %s doesn't match prefix %s after decode", uri, handler->prefix);
+      }
+      req->uri=uri;
+    }
   }
   req->path_info=req->uri+handler->prefix_len;
 
   // check cache
-  if (handler->on_generate_cache_key) {
+  if (req->get_method && !req->content_length && handler->on_generate_cache_key) { // POST requests are not cacheable
+    /*
+     * Cache_key is unique ID for each request with all its parameters, headers and options
+     * that could affect the response.
+     * Cache_key must conform to file path syntax, as many filters are going to use it as a file name.
+     * Handlers will typically use full request uri (host, port, ssl, path, query string)
+     * as initial key (file-path-encoded, see note above).
+     * Each filter shall add its own differentiators to the key in translate_cache_key() method
+     * regardless of whether it implements itself caching or not.
+     * E.g. gzip filter must differentiate requests coming with accept_gzip_encoding flag set
+     * from requests without that flag. So it is going to append '$gzip' suffix to all requests
+     * that it could possibly compress (it might not compress some content at the end
+     * for various reasons, e.g. flags in response, but those is not going to affect the cache_key).
+     * Each filter can have its own cache_key. Cache_key of a filter is not affected by filters
+     * coming after it in filter chain.
+     */
     if (handler->on_generate_cache_key(conn, req, resp)==NXWEB_NEXT) return NXWEB_NEXT;
-  }
-  if (resp->cache_key) {
-    const char* cache_key=resp->cache_key;
-    int cache_key_root_len=resp->cache_key_root_len;
-    _Bool have_file_key=(*cache_key!=' ');
-    if (handler->num_filters) {
-      int i;
-      nxweb_filter* filter;
-      for (i=0; i<handler->num_filters; i++) {
-        if (req->filter_data[i]->bypass) continue;
-        filter=handler->filters[i];
-        if (!filter->translate_cache_key) continue;
-        if (filter->translate_cache_key(conn, req, resp, req->filter_data[i], cache_key, cache_key_root_len)==NXWEB_NEXT) continue;
-        cache_key=req->filter_data[i]->cache_key;
-        cache_key_root_len=req->filter_data[i]->cache_key_root_len;
-        if (*cache_key!=' ') have_file_key=1;
-        assert(cache_key);
+    if (resp->cache_key && *resp->cache_key) {
+      const char* cache_key=resp->cache_key;
+      if (num_filters) {
+        int i;
+        nxweb_filter* filter;
+        nxweb_filter_data* fdata;
+        for (i=0; i<num_filters; i++) {
+          fdata=req->filter_data[i];
+          if (!fdata || fdata->bypass) continue;
+          filter=filters[i];
+          if (!filter->translate_cache_key) continue;
+          if (filter->translate_cache_key(filter, conn, req, resp, fdata, cache_key)==NXWEB_NEXT) continue;
+          cache_key=fdata->cache_key;
+          assert(cache_key && *cache_key);
+        }
+        resp->cache_key=cache_key;
       }
-    }
-    if (handler->cache) {
-      nxweb_result res=nxweb_cache_try(conn, resp, cache_key, req->if_modified_since, 0);
-      if (res==NXWEB_OK) {
-        conn->hsp.cls->start_sending_response(&conn->hsp, resp);
-        return NXWEB_OK;
+      if (handler->memcache) {
+        nxweb_result res=nxweb_cache_try(conn, resp, resp->cache_key, req->if_modified_since, 0);
+        if (res==NXWEB_OK) {
+          conn->hsp.cls->start_sending_response(&conn->hsp, resp);
+          return NXWEB_OK;
+        }
+        else if (res==NXWEB_REVALIDATE) {
+          // fall through
+        }
+        else if (res!=NXWEB_MISS) return res;
       }
-      else if (res==NXWEB_REVALIDATE) {
-        // fall through
-      }
-      else if (res!=NXWEB_MISS) return res;
-    }
-    if (!have_file_key) { // only had virtual keys through translation
-      if (resp->last_modified) {
+      if (resp->last_modified) { // in case one of filters has already determined resp->last_modified
         if (req->if_modified_since && resp->last_modified<=req->if_modified_since) {
           resp->status_code=304;
           resp->status="Not Modified";
@@ -136,72 +157,91 @@ int nxweb_select_handler(nxweb_http_server_connection* conn, nxweb_http_request*
           return NXWEB_OK;
         }
       }
-      // this is all we can do for virtual key
-    }
-    else {
-      if (*resp->cache_key==' ') { // was virtual key in the beginning
-        if (!resp->last_modified) resp->last_modified=nxe_get_current_http_time(conn->tdata->loop); // imply last_modified = now
-      }
-      else { // file key => stat() to check existence and get last_modified time
-        if (!resp->sendfile_info.st_mtime) {
-          if (stat(resp->cache_key, &resp->sendfile_info)==-1) assert(!resp->sendfile_info.st_mtime);
-        }
-        if (!resp->last_modified) resp->last_modified=resp->sendfile_info.st_mtime;
-        assert(resp->last_modified==resp->sendfile_info.st_mtime);
-      }
-      if (resp->last_modified) { // if file exists
-        if (req->if_modified_since && resp->last_modified<=req->if_modified_since) {
-          resp->status_code=304;
-          resp->status="Not Modified";
-          resp->last_modified=0;
-          conn->hsp.cls->start_sending_response(&conn->hsp, resp);
-          return NXWEB_OK;
-        }
-        if (handler->num_filters && !S_ISDIR(resp->sendfile_info.st_mode)) { // for virtual key st_mode is 0
-          int i;
-          nxweb_filter* filter;
-          nxweb_filter_data* fdata;
-          for (i=handler->num_filters-1; i>=0; i--) {
-            filter=handler->filters[i];
-            fdata=req->filter_data[i];
-            if (filter->serve_from_cache && fdata && !fdata->bypass && fdata->cache_key && *fdata->cache_key!=' ') {
-              if (stat(fdata->cache_key, &fdata->cache_key_finfo)!=-1) {
-                if (fdata->cache_key_finfo.st_mtime >= resp->last_modified) {
-                  if (filter->serve_from_cache(conn, req, resp, fdata)==NXWEB_NEXT) continue;
-                  for (i++; i<conn->handler->num_filters; i++) {
-                    filter=handler->filters[i];
-                    nxweb_filter_data* fdata1=req->filter_data[i];
-                    if (fdata1 && !fdata1->bypass && filter->do_filter)
-                      filter->do_filter(conn, req, resp, fdata1);
+      if (num_filters) {
+        time_t check_time=resp->last_modified? resp->last_modified : nxe_get_current_http_time(conn->tdata->loop);
+        int i;
+        nxweb_filter* filter;
+        nxweb_filter_data* fdata;
+        for (i=num_filters-1; i>=0; i--) {
+          filter=filters[i];
+          fdata=req->filter_data[i];
+          if (filter->serve_from_cache && fdata && !fdata->bypass) {
+            nxweb_result r=filter->serve_from_cache(filter, conn, req, resp, fdata, check_time);
+            if (r==NXWEB_OK) { // filter has served content (which has not expired by check_time)
+              // process it through filters & send to client
+              for (i++; i<num_filters; i++) {
+                filter=filters[i];
+                nxweb_filter_data* fdata1=req->filter_data[i];
+                if (fdata1 && !fdata1->bypass && filter->do_filter) {
+                  if (filter->do_filter(filter, conn, req, resp, fdata1)==NXWEB_DELAY) {
+                    resp->run_filter_idx=i+1; // resume from next filter
+                    return NXWEB_OK;
                   }
-                  if (handler->cache) {
-                    nxweb_cache_store_response(conn, resp);
-                  }
-                  conn->hsp.cls->start_sending_response(&conn->hsp, resp);
-                  return NXWEB_OK;
-                }
-                else {
-                  if (filter->revalidate_cache && filter->revalidate_cache(conn, req, resp, fdata)==NXWEB_OK) break;
                 }
               }
-              // break; -- why did I put this break here?
+              if (handler->memcache) {
+                nxweb_cache_store_response(conn, resp);
+              }
+              conn->hsp.cls->start_sending_response(&conn->hsp, resp);
+              return NXWEB_OK;
             }
+            /*
+            else if (r==NXWEB_REVALIDATE) { // filter has content but it has expired
+              // the filter has already set if_modified_since field in request (revalidation mode)
+              // it must be ready to process 304 Not Modified response
+              // on the way back in its do_filter()
+            }
+            else { // no cached content OR cached content's last_modified is older than req->if_modified_since
+            }
+            */
           }
         }
-        // we do have original resp->cache_key present on disk, but it needs to be served by handler, then re-processed by filters;
-        // do this in nxweb_start_sending_response()
       }
     }
   }
 
-  if (handler->on_select) return handler->on_select(conn, req, resp);
-  else return NXWEB_OK;
+  nxweb_result r=NXWEB_OK;
+  if (handler->on_select) r=handler->on_select(conn, req, resp);
+  if (r!=NXWEB_OK) {
+    if (num_filters) {
+      // filters have been initialized => finalize them
+      int i;
+      nxweb_filter* filter;
+      nxweb_filter_data* fdata;
+      for (i=0; i<num_filters; i++) {
+        filter=filters[i];
+        fdata=req->filter_data[i];
+        if (fdata && filter->finalize)
+          filter->finalize(filter, conn, req, resp, fdata);
+        req->filter_data[i]=0; // call no more
+      }
+    }
+    // restore saved fields
+    req->uri=uri_original;
+    req->if_modified_since=if_modified_since_original;
+    // reset changed fields
+    conn->handler=0;
+    conn->handler_param=(nxe_data)0;
+    resp->cache_key=0;
+    resp->last_modified=0;
+    resp->mtype=0;
+    resp->content_type=0;
+    resp->content_charset=0;
+    resp->sendfile_path=0;
+    if (resp->sendfile_fd>0) {
+      close(resp->sendfile_fd);
+    }
+    resp->sendfile_fd=0;
+    if (resp->sendfile_info.st_ino) memset(&resp->sendfile_info, 0, sizeof(resp->sendfile_info));
+  }
+  return r;
 }
 
 nxweb_result _nxweb_default_request_dispatcher(nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
   nxweb_handler* h=nxweb_server_config.handler_list;
   const char* uri=req->uri;
   const char* host=req->host;
+  _Bool secure=conn->secure;
   // NOTE: host is always lowercase; ensured by _nxweb_parse_http_request()
   int host_len;
   if (host) {
@@ -211,22 +251,25 @@ nxweb_result _nxweb_default_request_dispatcher(nxweb_http_server_connection* con
   else {
     host_len=0;
   }
+  int uri_len=strlen(uri);
   while (h) {
-    if (!h->vhost_len || (host_len && nxweb_vhost_match(host, host_len, h->vhost, h->vhost_len))) {
-      if (!h->prefix_len || nxweb_url_prefix_match(uri, h->prefix, h->prefix_len)) {
-        nxweb_result res=nxweb_select_handler(conn, req, resp, h, h->param);
-        if (res!=NXWEB_NEXT) {
-          if (res==NXWEB_ERROR) {
-            // request processing terminated by http error response
-            if (req->content_length) resp->keep_alive=0; // close connection if there is body pending
-            nxweb_start_sending_response(conn, resp);
-            return NXWEB_ERROR;
+    if ((secure && !h->insecure_only) || (!secure && !h->secure_only)) {
+      if (!h->vhost_len || (host_len && nxweb_vhost_match(host, host_len, h->vhost, h->vhost_len))) {
+        if (!h->prefix_len || nxweb_url_prefix_match(uri, uri_len, h->prefix, h->prefix_len)) {
+          nxweb_result res=nxweb_select_handler(conn, req, resp, h, h->param);
+          if (res!=NXWEB_NEXT) {
+            if (res==NXWEB_ERROR) {
+              // request processing terminated by http error response
+              if (req->content_length) resp->keep_alive=0; // close connection if there is body pending
+              nxweb_start_sending_response(conn, resp);
+              return NXWEB_ERROR;
+            }
+            if (res!=NXWEB_OK) {
+              nxweb_log_error("handler %s on_select() returned error %d", h->name, res);
+              break;
+            }
+            return NXWEB_OK;
           }
-          if (res!=NXWEB_OK) {
-            nxweb_log_error("handler %s on_select() returned error %d", h->name, res);
-            break;
-          }
-          return NXWEB_OK;
         }
       }
     }
@@ -262,6 +305,12 @@ void _nxweb_register_module(nxweb_module* module) {
 
 void _nxweb_register_handler(nxweb_handler* handler, nxweb_handler* base) {
   handler->prefix_len=handler->prefix? strlen(handler->prefix) : 0;
+  if (handler->prefix_len) {
+    if (handler->prefix[0]!='/') {
+      nxweb_log_error("handler's prefix must start with '/'; handler=%s with prefix=%s not allowed", handler->name, handler->prefix);
+      exit(1);
+    }
+  }
   handler->vhost_len=handler->vhost? strlen(handler->vhost) : 0;
   if (base) {
     if (!handler->on_generate_cache_key) handler->on_generate_cache_key=base->on_generate_cache_key;
@@ -305,7 +354,12 @@ void _nxweb_register_handler(nxweb_handler* handler, nxweb_handler* base) {
 
 static void invoke_request_handler_in_worker(void* ptr) {
   nxweb_http_server_connection* conn=ptr;
-  conn->handler->on_request(conn, &conn->hsp.req, &conn->hsp._resp);
+  if (conn && conn->handler && conn->handler->on_request) {
+    conn->handler->on_request(conn, &conn->hsp.req, &conn->hsp._resp);
+  }
+  else {
+    nxweb_log_error("invalid conn handler reached worker");
+  }
 }
 
 static void nxweb_http_server_connection_worker_complete_on_message(nxe_subscriber* sub, nxe_publisher* pub, nxe_data data) {
@@ -314,9 +368,8 @@ static void nxweb_http_server_connection_worker_complete_on_message(nxe_subscrib
   long cnt=0;
   while (!conn->worker_job_done) cnt++;
   __sync_synchronize(); // full memory barrier
-  assert(conn->hsp._resp.content && conn->hsp._resp.content_length);
   nxweb_start_sending_response(conn, &conn->hsp._resp);
-  if (cnt) nxweb_log_error("job not done in %ld steps", cnt);
+  if (cnt) nxweb_log_warning("job not done in %ld steps", cnt);
 }
 
 /*
@@ -362,10 +415,12 @@ static void nxweb_http_server_connection_events_sub_on_message(nxe_subscriber* s
   nxweb_http_response* resp=&conn->hsp._resp;
   if (data.i==NXD_HSP_REQUEST_RECEIVED) {
     assert(nxweb_server_config.request_dispatcher);
+    req->received_time=nxweb_get_loop_time(conn);
+    nxweb_access_log_on_request_received(conn, req);
     nxweb_server_config.request_dispatcher(conn, req, resp);
     if (!conn->handler) conn->handler=&_nxweb_default_handler;
 
-    if (conn->hsp.state==HSP_SENDING_HEADERS) return; // one of callbacks has already started sending headers
+    if (conn->hsp.state==HSP_SENDING_HEADERS || resp->run_filter_idx) return; // one of callbacks has already started sending response
 
     nxweb_handler* h=conn->handler;
     nxweb_handler_flags flags=h->flags;
@@ -395,19 +450,18 @@ static void nxweb_http_server_connection_events_sub_on_message(nxe_subscriber* s
 
     if (req->content_length) {
       if (h->on_post_data) h->on_post_data(conn, req, resp);
-      else {
-        if (!conn->hsp.cls->get_request_body_out_pair(&conn->hsp)) { // stream not connected
-          if (req->content_length>NXWEB_MAX_REQUEST_BODY_SIZE) {
-            nxweb_send_http_error(resp, 413, "Request Entity Too Large");
-            resp->keep_alive=0; // close connection
-            nxweb_start_sending_response(conn, resp);
-            return;
-          }
-          nxe_loop* loop=conn->tdata->loop;
-          nxd_ibuffer_init(&conn->ib, conn->hsp.nxb, req->content_length>0? req->content_length+1 : NXWEB_MAX_REQUEST_BODY_SIZE);
-          conn->hsp.cls->connect_request_body_out(&conn->hsp, &conn->ib.data_in);
-          conn->hsp.cls->start_receiving_request_body(&conn->hsp);
+      if (!conn->hsp.cls->get_request_body_out_pair(&conn->hsp)) { // stream still not connected
+        if (req->content_length>NXWEB_MAX_REQUEST_BODY_SIZE) {
+          nxweb_send_http_error(resp, 413, "Request Entity Too Large");
+          resp->keep_alive=0; // close connection
+          nxweb_start_sending_response(conn, resp);
+          return;
         }
+        nxe_loop* loop=conn->tdata->loop;
+        nxd_ibuffer_init(&conn->ib, conn->hsp.nxb, req->content_length>0? req->content_length+1 : NXWEB_MAX_REQUEST_BODY_SIZE);
+        conn->hsp.cls->connect_request_body_out(&conn->hsp, &conn->ib.data_in);
+        conn->hsp.cls->start_receiving_request_body(&conn->hsp);
+        req->buffering_to_memory=1;
       }
     }
     else {
@@ -419,10 +473,10 @@ static void nxweb_http_server_connection_events_sub_on_message(nxe_subscriber* s
     nxweb_handler* h=conn->handler;
     nxweb_handler_flags flags=h->flags;
     if (h->on_post_data_complete) h->on_post_data_complete(conn, req, resp);
-    else {
-      if (conn->hsp.cls->get_request_body_out_pair(&conn->hsp)==&conn->ib.data_in) {
-        req->content=nxd_ibuffer_get_result(&conn->ib, 0);
-      }
+    if (req->buffering_to_memory && conn->hsp.cls->get_request_body_out_pair(&conn->hsp)==&conn->ib.data_in) {
+      int size;
+      req->content=nxd_ibuffer_get_result(&conn->ib, &size);
+      assert(req->content_received==size);
     }
     invoke_request_handler(conn, req, resp, h, flags);
   }
@@ -442,7 +496,7 @@ static void nxweb_http_server_connection_events_sub_on_message(nxe_subscriber* s
     conn->handler=0;
     conn->handler_param=(nxe_data)0;
     if (conn->hsp.headers_bytes_received) {
-      nxweb_log_error("conn %p error: i=%d errno=%d state=%d rc=%d br=%d", conn, data.i, errno, conn->hsp.state, conn->hsp.request_count, conn->hsp.headers_bytes_received);
+      nxweb_log_warning("conn %p error: i=%d errno=%d state=%d rc=%d br=%d", conn, data.i, errno, conn->hsp.state, conn->hsp.request_count, conn->hsp.headers_bytes_received);
     }
     if (!conn->hsp.headers_bytes_received && (data.i==NXE_RDHUP || data.i==NXE_HUP || data.i==NXE_RDCLOSED)) {
       // normal close
@@ -466,16 +520,22 @@ void nxweb_start_sending_response(nxweb_http_server_connection* conn, nxweb_http
     int i;
     nxweb_http_request* req=&conn->hsp.req;
     nxweb_filter* filter;
-    nxweb_filter** pfilter=conn->handler->filters;
-    for (i=0; i<conn->handler->num_filters; i++, pfilter++) {
-      filter=*pfilter;
-      nxweb_filter_data* fdata=req->filter_data[i];
-      if (fdata && !fdata->bypass && filter->do_filter)
-        filter->do_filter(conn, req, resp, fdata);
+    nxweb_filter_data* fdata;
+    nxweb_filter** filters=conn->handler->filters;
+    const int num_filters=conn->handler->num_filters;
+    for (i=resp->run_filter_idx; i<num_filters; i++) {
+      filter=filters[i];
+      fdata=req->filter_data[i];
+      if (fdata && !fdata->bypass && filter->do_filter) {
+        if (filter->do_filter(filter, conn, req, resp, fdata)==NXWEB_DELAY) {
+          resp->run_filter_idx=i+1; // resume from next filter
+          return;
+        }
+      }
     }
   }
 
-  if (conn->handler && conn->handler->cache) {
+  if (conn->handler && conn->handler->memcache) {
     nxweb_cache_store_response(conn, resp);
   }
   conn->hsp.cls->start_sending_response(&conn->hsp, resp);
@@ -509,7 +569,7 @@ static void nxweb_http_server_connection_connect(nxweb_http_server_connection* c
   nxe_subscribe(loop, &conn->hsp.events_pub, &conn->events_sub);
   nxe_connect_streams(loop, &conn->sock.fs.data_is, &conn->hsp.data_in);
   nxe_connect_streams(loop, &conn->hsp.data_out, &conn->sock.fs.data_os);
-
+  conn->uid=nxweb_generate_unique_id();
   //__sync_add_and_fetch(&num_connections, 1);
 }
 
@@ -542,7 +602,7 @@ void nxweb_http_server_connection_finalize(nxweb_http_server_connection* conn, i
   conn->hsp.cls->finalize(&conn->hsp);
   if (conn->sock.cls) conn->sock.cls->finalize((nxd_socket*)&conn->sock, good);
   nxp_free(conn->tdata->free_conn_pool, conn);
-  //if (!__sync_sub_and_fetch(&num_connections, 1)) nxweb_log_error("all connections closed");
+  //if (!__sync_sub_and_fetch(&num_connections, 1)) nxweb_log_info("all connections closed");
 }
 
 nxweb_http_server_connection* nxweb_http_server_subrequest_start(nxweb_http_server_connection* parent_conn, void (*on_response_ready)(nxe_data data), const char* host, const char* uri) {
@@ -551,6 +611,8 @@ nxweb_http_server_connection* nxweb_http_server_subrequest_start(nxweb_http_serv
   nxweb_http_server_connection* conn=nxp_alloc(tdata->free_conn_pool);
   //nxweb_http_server_connection_init(conn, tdata, lconf_idx);
   memset(conn, 0, sizeof(nxweb_http_server_connection));
+  conn->uid=nxweb_generate_unique_id();
+  conn->secure=parent_conn->secure;
   conn->tdata=tdata;
   conn->parent=parent_conn;
   conn->next=parent_conn->subrequests;
@@ -594,6 +656,8 @@ static void on_net_thread_shutdown(nxe_subscriber* sub, nxe_publisher* pub, nxe_
   for (i=0; i<NXWEB_MAX_PROXY_POOLS; i++) {
     nxd_http_proxy_pool_finalize(&tdata->proxy_pool[i]);
   }
+
+  nxweb_access_log_thread_flush();
 }
 
 static void on_net_thread_gc(nxe_subscriber* sub, nxe_publisher* pub, nxe_data data) {
@@ -602,6 +666,7 @@ static void on_net_thread_gc(nxe_subscriber* sub, nxe_publisher* pub, nxe_data d
   nxp_gc(tdata->free_conn_nxb_pool);
   nxp_gc(tdata->free_rbuf_pool);
   nxw_gc_factory(&tdata->workers_factory);
+  nxweb_access_log_thread_flush();
 }
 
 static void accept_connection(nxe_subscriber* sub, nxe_publisher* pub, nxe_data data) {
@@ -716,6 +781,7 @@ static void* net_thread_main(void* ptr) {
 */
   nxe_destroy(loop);
   nxweb_log_error("network thread clean exit");
+  nxweb_access_log_thread_flush();
   return 0;
 }
 
@@ -738,12 +804,17 @@ static void on_sigterm(int sig) {
 
     nxe_trigger_eventfd(&tdata->shutdown_efs);
   }
-  alarm(5); // make sure we terminate via SIGALRM if some connections do not close in 5 seconds
+  alarm(nxweb_server_config.shutdown_timeout); // make sure we terminate via SIGALRM if some connections do not close in 5 seconds
 }
 
 static void on_sigalrm(int sig) {
   nxweb_log_error("SIGALRM received. Exiting");
   exit(EXIT_SUCCESS);
+}
+
+static void on_sigusr1(int sig) {
+  nxweb_log_error("SIGUSR1 received. Restarting access_log");
+  nxweb_access_log_restart();
 }
 
 void nxweb_set_timeout(enum nxweb_timers timer_idx, nxe_time_t timeout) {
@@ -787,10 +858,15 @@ int nxweb_setup_http_proxy_pool(int idx, const char* host_and_port) {
 void nxweb_run() {
   int i;
 
+  nxweb_server_config.work_dir=getcwd(0, 0);
+
   pid_t pid=getpid();
   main_thread_id=pthread_self();
   _nxweb_num_net_threads=(int)sysconf(_SC_NPROCESSORS_ONLN);
   if (_nxweb_num_net_threads>NXWEB_MAX_NET_THREADS) _nxweb_num_net_threads=NXWEB_MAX_NET_THREADS;
+
+  pthread_mutex_init(&nxweb_server_config.access_log_start_mux, 0);
+  nxweb_access_log_restart();
 
   nxweb_log_error("NXWEB startup: pid=%d net_threads=%d pg=%d"
                   " short=%d int=%d long=%d size_t=%d evt=%d conn=%d req=%d td=%d",
@@ -836,6 +912,7 @@ void nxweb_run() {
   sigaddset(&set, SIGINT);
   sigaddset(&set, SIGQUIT);
   sigaddset(&set, SIGHUP);
+  sigaddset(&set, SIGUSR1);
   if (pthread_sigmask(SIG_BLOCK, &set, NULL)) {
     nxweb_log_error("can't set pthread_sigmask");
     exit(EXIT_SUCCESS); // simulate normal exit so nxweb is not respawned
@@ -859,6 +936,7 @@ void nxweb_run() {
 
   signal(SIGTERM, on_sigterm);
   signal(SIGINT, on_sigterm);
+  signal(SIGUSR1, on_sigusr1);
   signal(SIGALRM, on_sigalrm);
 
   // Unblock signals for the main thread;
@@ -895,5 +973,10 @@ void nxweb_run() {
       _nxweb_free_addrinfo(nxweb_server_config.http_proxy_pool_config[i].saddr);
   }
 
-  nxweb_log_error("end of _nxweb_main()");
+  nxweb_access_log_stop();
+  pthread_mutex_destroy(&nxweb_server_config.access_log_start_mux);
+
+  free(nxweb_server_config.work_dir);
+
+  nxweb_log_error("end of nxweb_run()");
 }

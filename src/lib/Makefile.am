@@ -12,9 +12,9 @@ libnxweb_la_SOURCES = \
 	nxd_http_server_proto.c nxd_http_server_proto_subrequest.c \
 	nxd_socket.c nxd_ssl_socket.c nxd_streamer.c \
 	nx_event.c nx_file_reader.c nx_pool.c nx_workers.c \
-	http_subrequest.c templates.c \
+	http_subrequest.c templates.c access_log.c main_stub.c \
 	\
-	modules/http_proxy.c modules/sendfile.c \
+	modules/http_proxy.c modules/sendfile.c modules/host_redirect.c \
 	\
 	filters/ssi_filter.c \
 	filters/templates_filter.c \
@@ -30,6 +30,11 @@ endif
 if WITH_IMAGEMAGICK
 libnxweb_la_SOURCES += filters/image_filter.c
 libnxweb_la_SOURCES += filters/draw_filter.c
+endif
+
+if WITH_PYTHON
+libnxweb_la_SOURCES += modules/python.c
+AM_CFLAGS += $(PYTHON_CPPFLAGS)
 endif
 
 libnxweb_la_LDFLAGS = -version-info $(NXWEB_LIB_VERSION_INFO)

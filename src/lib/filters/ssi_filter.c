@@ -195,12 +195,12 @@ char* ssi_buffer_get_result(ssi_buffer* ssib, int* size) {
 }
 
 
-static nxweb_filter_data* ssi_init(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
+static nxweb_filter_data* ssi_init(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
   nxweb_filter_data* fdata=nxb_calloc_obj(req->nxb, sizeof(ssi_filter_data));
   return fdata;
 }
 
-static void ssi_finalize(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+static void ssi_finalize(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
   ssi_filter_data* sfdata=(ssi_filter_data*)fdata;
   if (sfdata->ssib.data_in.pair) nxe_disconnect_streams(sfdata->ssib.data_in.pair, &sfdata->ssib.data_in);
   if (sfdata->input_fd) {
@@ -209,35 +209,13 @@ static void ssi_finalize(struct nxweb_http_server_connection* conn, nxweb_http_r
   }
 }
 
-static nxweb_result ssi_translate_cache_key(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key, int root_len) {
-  if (!resp->ssi_on) {
-    if (*resp->cache_key!=' ') { // response originally comes from file
-      if (!resp->mtype && *key!=' ') {
-        resp->mtype=nxweb_get_mime_type_by_ext(key); // always returns not null
-      }
-      if (!resp->mtype && resp->content_type) {
-        resp->mtype=nxweb_get_mime_type(resp->content_type);
-      }
-    }
-    if (resp->mtype && !resp->mtype->ssi_on) {
-      fdata->bypass=1;
-      return NXWEB_NEXT;
-    }
-  }
-
-  // transform to virtual key ( )
-  int plen=strlen(key)-root_len;
-  assert(plen>=0);
-  int rlen=sizeof(" /_ssi_")-1;
-  char* fc_key=nxb_alloc_obj(req->nxb, rlen+plen+1);
-  memcpy(fc_key, " /_ssi_", rlen);
-  strcpy(fc_key+rlen, key+root_len);
-  fdata->cache_key=fc_key;
-  fdata->cache_key_root_len=1;
+static nxweb_result ssi_translate_cache_key(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key, int root_len) {
+  // ssi result does not depend on request options other than basic ones
+  // fdata->cache_key=key; // just store it
   return NXWEB_OK;
 }
 
-static nxweb_result ssi_do_filter(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+static nxweb_result ssi_do_filter(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
   ssi_filter_data* sfdata=(ssi_filter_data*)fdata;
   if (resp->status_code && resp->status_code!=200) return NXWEB_OK;
 
@@ -284,4 +262,4 @@ static nxweb_result ssi_do_filter(struct nxweb_http_server_connection* conn, nxw
 }
 
 nxweb_filter ssi_filter={.name="ssi", .init=ssi_init, .finalize=ssi_finalize,
-        .translate_cache_key=ssi_translate_cache_key, .do_filter=ssi_do_filter};
+        .do_filter=ssi_do_filter};

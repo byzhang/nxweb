@@ -36,7 +36,7 @@ static const char* WEEK_DAY[]={"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 static const char* MONTH[]={"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
 int nxweb_format_http_time(char* buf, struct tm* tm) {
-  // eg. Tue, 24 Jan 2012 13:05:54 GMT (29 chars)
+  // eg. Tue, 24 Jan 2012 13:05:54 GMT (max 29 chars)
   char* p=buf;
   char num[16];
   strcpy(p, WEEK_DAY[tm->tm_wday]);
@@ -162,6 +162,31 @@ time_t nxweb_parse_http_time(const char* str) { // must be GMT
   time_t t=mktime(&tm) - timezone;
   if (t==-1) return 0;
   return t;
+}
+
+int nxweb_format_iso8601_time(char* buf, struct tm* tm) { // ISO 8601
+  // eg. 2012-01-24T13:05:54 (19 chars)
+  char* p=buf;
+  uint_to_decimal_string_zeropad(tm->tm_year+1900, p, 4, 0);
+  p+=4;
+  *p++='-';
+  uint_to_decimal_string_zeropad(tm->tm_mon+1, p, 2, 0);
+  p+=2;
+  *p++='-';
+  uint_to_decimal_string_zeropad(tm->tm_mday, p, 2, 0);
+  p+=2;
+  *p++='T';
+  uint_to_decimal_string_zeropad(tm->tm_hour, p, 2, 0);
+  p+=2;
+  *p++=':';
+  uint_to_decimal_string_zeropad(tm->tm_min, p, 2, 0);
+  p+=2;
+  *p++=':';
+  uint_to_decimal_string_zeropad(tm->tm_sec, p, 2, 0);
+  p+=2;
+  *p='\0';
+  assert(p-buf==19);
+  return p-buf;
 }
 
 
@@ -446,6 +471,8 @@ int _nxweb_parse_http_request(nxweb_http_request* req, char* headers, char* end_
   }
   req->headers=header_map;
 
+  if (!req->host || !*req->host) return -1; // host is required
+
   req->path_info=0;
   {
     const char* g;
@@ -709,6 +736,60 @@ void nxweb_add_response_header(nxweb_http_response* resp, const char* name, cons
   resp->headers=nx_simple_map_add(resp->headers, header);
 }
 
+void nxweb_add_response_header_safe(nxweb_http_response* resp, const char* name, const char* value) {
+  int header_name_id=identify_http_header(name, strlen(name));
+  nxb_buffer* nxb=resp->nxb;
+  switch (header_name_id) {
+    case NXWEB_HTTP_CONTENT_TYPE: resp->content_type=nxb_copy_str(nxb, value); break;
+    case NXWEB_HTTP_CONTENT_LENGTH: /* skip */ break;
+    case NXWEB_HTTP_TRANSFER_ENCODING: /* skip */ break;
+    case NXWEB_HTTP_CONNECTION: /* skip */ break;
+    case NXWEB_HTTP_KEEP_ALIVE: /* skip */ break;
+    case NXWEB_HTTP_X_NXWEB_SSI: resp->ssi_on=!nx_strcasecmp(value, "ON"); break;
+    case NXWEB_HTTP_X_NXWEB_TEMPLATES: resp->templates_on=!nx_strcasecmp(value, "ON"); break;
+    case NXWEB_HTTP_DATE: /* skip */ break;
+    case NXWEB_HTTP_LAST_MODIFIED: resp->last_modified=nxweb_parse_http_time(value); break;
+    case NXWEB_HTTP_EXPIRES: resp->expires=nxweb_parse_http_time(value); break;
+    case NXWEB_HTTP_CACHE_CONTROL:
+      if (*value) {
+        char* p1=nxb_copy_str(nxb, value);
+        char *p, *cc_name, *cc_value;
+        _Bool dirty=0;
+        while (p1) {
+          p=strchr(p1, ',');
+          if (p) *p++='\0';
+          while (*p1 && (unsigned char)*p1<=SPACE) p1++;
+          cc_name=p1;
+          cc_value=strchr(p1, '=');
+          if (cc_value) {
+            *cc_value++='\0';
+            cc_value=nxweb_trunc_space(cc_value);
+          }
+          if (!nx_strcasecmp(cc_name, "no-cache")) resp->no_cache=1;
+          else if (!nx_strcasecmp(cc_name, "max-age") && cc_value) {
+            if (cc_value[0]=='0' && !cc_value[1]) resp->max_age=-1;
+            else resp->max_age=atol(cc_value);
+          }
+          else dirty=1;
+          p1=p;
+        }
+        if (dirty) { // there is something we could not recognize
+          resp->cache_control=nxb_copy_str(nxb, value);
+        }
+      }
+      break;
+    case NXWEB_HTTP_ETAG: resp->etag=nxb_copy_str(nxb, value); break;
+    default:
+      {
+        nx_simple_map_entry* header=nxb_calloc_obj(nxb, sizeof(nxweb_http_header));
+        header->name=nxb_copy_str(nxb, name);
+        header->value=nxb_copy_str(nxb, value);
+        resp->headers=nx_simple_map_add(resp->headers, header);
+        break;
+      }
+  }
+}
+
 void _nxweb_add_extra_response_headers(nxb_buffer* nxb, nxweb_http_header *headers) {
   nx_simple_map_entry* itr;
   const char* name;
@@ -747,8 +828,8 @@ void _nxweb_prepare_response_headers(nxe_loop* loop, nxweb_http_response *resp) 
 
   _Bool must_not_have_body=(resp->status_code==304 || resp->status_code==204 || resp->status_code==205);
   if (must_not_have_body) {
-    if (resp->content_length) nxweb_log_error("content_length specified for response that must not contain entity body");
-    if (resp->gzip_encoded) nxweb_log_error("gzip encoding specified for response that must not contain entity body");
+    if (resp->content_length) nxweb_log_warning("content_length specified for response that must not contain entity body");
+    if (resp->gzip_encoded) nxweb_log_warning("gzip encoding specified for response that must not contain entity body");
   }
 
   nxb_make_room(nxb, 200);
@@ -920,7 +1001,7 @@ void nxweb_send_http_error(nxweb_http_response *resp, int code, const char* mess
   //resp->keep_alive=0; // close connection after error response
 }
 
-int nxweb_send_file(nxweb_http_response *resp, char* fpath, int fpath_root_len, const struct stat* finfo, int gzip_encoded, off_t offset, size_t size, const nxweb_mime_type* mtype, const char* charset) {
+int nxweb_send_file(nxweb_http_response *resp, char* fpath, const struct stat* finfo, int gzip_encoded, off_t offset, size_t size, const nxweb_mime_type* mtype, const char* charset) {
   if (fpath==0) { // cancel sendfile
     if (resp->sendfile_fd) close(resp->sendfile_fd);
     resp->sendfile_fd=0;
@@ -932,10 +1013,9 @@ int nxweb_send_file(nxweb_http_response *resp, char* fpath, int fpath_root_len, 
   }
 
   // if no finfo provided by the caller, get it here
-  struct stat _finfo;
-  if (!finfo) {
-    if (stat(fpath, &_finfo)==-1) return -1;
-    finfo=&_finfo;
+  if (!finfo || !finfo->st_ino) {
+    if (stat(fpath, &resp->sendfile_info)==-1) return -1;
+    finfo=&resp->sendfile_info;
   }
   if (S_ISDIR(finfo->st_mode)) {
     return -2;
@@ -947,7 +1027,6 @@ int nxweb_send_file(nxweb_http_response *resp, char* fpath, int fpath_root_len, 
   //int fd=open(fpath, O_RDONLY|O_NONBLOCK);
   //if (fd==-1) return -1;
   resp->sendfile_path=fpath;
-  resp->sendfile_path_root_len=fpath_root_len;
   //resp->sendfile_fd=fd;
   resp->sendfile_offset=offset;
   resp->content_length=size? size : finfo->st_size-offset;
@@ -1030,7 +1109,7 @@ const char* _nxweb_prepare_client_request_headers(nxweb_http_request *req) {
 
   if (req->uid) {
     nxb_append_str(nxb, "X-NXWEB-Request-ID: ");
-    nxb_append_uint_hex_zeropad(nxb, req->uid, 16);
+    nxb_append_uint64_hex_zeropad(nxb, req->uid, 16);
     nxb_append_str(nxb, "\r\n");
   }
 
@@ -1039,7 +1118,7 @@ const char* _nxweb_prepare_client_request_headers(nxweb_http_request *req) {
     while (preq->parent_req) preq=preq->parent_req; // find root request
     if (preq->uid) {
       nxb_append_str(nxb, "X-NXWEB-Root-Request-ID: ");
-      nxb_append_uint_hex_zeropad(nxb, preq->uid, 16);
+      nxb_append_uint64_hex_zeropad(nxb, preq->uid, 16);
       nxb_append_str(nxb, "\r\n");
     }
   }
@@ -1270,10 +1349,13 @@ void _nxb_append_escape_url(nxb_buffer* nxb, const char* url) {
   }
 }
 
-void _nxb_append_escape_file_path(nxb_buffer* nxb, const char* path) {
+// allow up to ~22 chars to be appended as extensions
+#define MAX_PATH_SEGMENT 230
+
+void _nxb_append_encode_file_path(nxb_buffer* nxb, const char* path) {
   if (!path || !*path) return;
   int path_len=strlen(path);
-  int max_size=path_len*3+path_len/250;
+  int max_size=path_len*3+path_len/MAX_PATH_SEGMENT;
   nxb_make_room(nxb, max_size);
 
   const char* pt=path;
@@ -1285,19 +1367,19 @@ void _nxb_append_escape_file_path(nxb_buffer* nxb, const char* path) {
       nxb_append_char_fast(nxb, c);
     }
     else {
-      if (fname_len_count>=250) { // break long names into ~250 char segments (ext3/4 limit)
+      if (fname_len_count>=MAX_PATH_SEGMENT) { // break long names into ~MAX_PATH_SEGMENT char segments (ext3/4 limit)
         nxb_append_char_fast(nxb, '/');
         fname_len_count=0;
       }
-      if (IS_FILE_PATH_CHAR(c)) {
-        nxb_append_char_fast(nxb, c);
-        fname_len_count++;
-      }
-      else {
+      if ((c=='.' && fname_len_count==0) || !IS_FILE_PATH_CHAR(c)) {
         nxb_append_char_fast(nxb, '$');
         nxb_append_char_fast(nxb, HEX_DIGIT(c>>4));
         nxb_append_char_fast(nxb, HEX_DIGIT(c));
-        fname_len_count+=3;
+        fname_len_count+=3; // might go over MAX_PATH_SEGMENT by 2 chars but that is OK
+      }
+      else {
+        nxb_append_char_fast(nxb, c);
+        fname_len_count++;
       }
     }
   }
@@ -1420,31 +1502,42 @@ char* nxweb_url_decode(char* src, char* dst) { // can do it inplace
   return dst;
 }
 
-char* _nxweb_file_path_decode(char* src, char* dst) { // can do it inplace
-  register char *d=(dst?dst:src), *s=src;
-  for (; *s; s++) {
-    char c=*s;
-    if (c=='$' && s[1] && s[2]) {
-      *d++=HEX_DIGIT_VALUE(s[1])<<4 | HEX_DIGIT_VALUE(s[2]);
-      s+=2;
-    }
-    else *d++=c;
-  }
-  *d='\0';
-  return dst;
-}
-
 int nxweb_remove_dots_from_uri_path(char* path) { // returns 0=OK
   if (!*path) return 0; // end of path
   if (*path!='/') return -1; // invalid path
-  while (1) {
-    if (path[1]=='.' && path[2]=='.' && (path[3]=='/' || path[3]=='\0')) { // /..(/.*)?$
-      memmove(path, path+3, strlen(path+3)+1);
-      return 1;
+
+  char* src=path+1; // skip first '/'
+  char* dst=src;
+
+  while (*src) {
+    // process path segment
+    if (*src=='/') { // two '/' in a row => skip
+      src++;
+      continue;
     }
-    char* p1=strchr(path+1, '/');
-    if (!p1) return 0;
-    if (!nxweb_remove_dots_from_uri_path(p1)) return 0;
-    memmove(path, p1, strlen(p1)+1);
+    if (*src=='.') {
+      switch (src[1]) {
+        case '/': src+=2; continue;
+        case '\0': src++; continue;
+        case '.':
+          if (src[2]=='/' || src[2]=='\0') { // /..(/.*)?$
+            if (dst==path+1) { // we are at root already
+              return -1; // invalid path
+            }
+            // cut last path segment from dst
+            while ((--dst)[-1] != '/');
+            src+=3;
+            continue;
+          }
+          break;
+      }
+    }
+    // copy segment
+    *dst++=*src++;
+    while (*src && *src!='/') {
+      *dst++=*src++;
+    }
+    if (!(*dst++=*src++)) break;
   }
+  return 0;
 }

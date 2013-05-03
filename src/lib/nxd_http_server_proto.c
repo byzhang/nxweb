@@ -29,16 +29,24 @@ static void nxd_http_server_proto_start_sending_response(nxd_http_server_proto* 
 
 void _nxweb_call_request_finalizers(nxd_http_server_proto* hsp) {
   // this could be called more than once, be ready for it
+
+  nxweb_http_request_data* rdata=hsp->req.data_chain;
+  nxweb_http_server_connection* conn=(nxweb_http_server_connection*)((char*)hsp-offsetof(nxweb_http_server_connection, hsp));
+  nxweb_http_request* req=&hsp->req;
+  nxweb_http_response* resp=hsp->resp;
+
+  if (req->access_log) {
+    nxweb_access_log_on_request_complete(conn, req, resp);
+    nxweb_access_log_write(req);
+    req->access_log=0;
+  }
+
   if (hsp->req_finalize) {
     hsp->req_finalize(hsp, hsp->req_data);
     hsp->req_finalize=0; // call no more
     hsp->req_data=0;
   }
-  nxweb_http_request_data* rdata=hsp->req.data_chain;
-  nxweb_http_request* req=&hsp->req;
-  nxweb_http_response* resp=hsp->resp;
   // it is not very good that we access higher level (connection) object here but...
-  nxweb_http_server_connection* conn=(nxweb_http_server_connection*)((char*)hsp-offsetof(nxweb_http_server_connection, hsp));
   while (rdata) {
     if (rdata->finalize) {
       rdata->finalize(conn, req, resp, rdata->value);
@@ -51,12 +59,13 @@ void _nxweb_call_request_finalizers(nxd_http_server_proto* hsp) {
     int i;
     nxweb_filter* filter;
     nxweb_filter_data* fdata;
-    nxweb_filter** pfilter=conn->handler->filters;
-    for (i=0; i<conn->handler->num_filters; i++, pfilter++) {
-      filter=*pfilter;
+    nxweb_filter** filters=conn->handler->filters;
+    const int num_filters=conn->handler->num_filters;
+    for (i=0; i<num_filters; i++) {
+      filter=filters[i];
       fdata=req->filter_data[i];
       if (fdata && filter->finalize)
-        filter->finalize(conn, req, resp, fdata);
+        filter->finalize(filter, conn, req, resp, fdata);
       req->filter_data[i]=0; // call no more
     }
   }
@@ -425,6 +434,7 @@ static nxe_ssize_t resp_body_in_write_or_sendfile(nxe_ostream* os, nxe_istream* 
       nxe_ostream_unset_ready(os);
     }
   }
+  hsp->resp->bytes_sent+=bytes_sent;
   if (*flags&NXEF_EOF && bytes_sent==size && (!hsp->resp->chunked_autoencode || _nxweb_encode_chunked_is_complete(&hsp->resp->cestate))) {
     // end of response => rearm connection
     request_complete(loop, hsp);
@@ -455,21 +465,21 @@ static void timer_keep_alive_on_timeout(nxe_timer* timer, nxe_data data) {
   nxd_http_server_proto* hsp=(nxd_http_server_proto*)((char*)timer-offsetof(nxd_http_server_proto, timer_keep_alive));
   //nxe_loop* loop=sub->super.loop;
   nxe_publish(&hsp->events_pub, (nxe_data)NXD_HSP_KEEP_ALIVE_TIMEOUT);
-  nxweb_log_error("connection %p keep-alive timeout", hsp);
+  nxweb_log_info("connection %p keep-alive timeout", hsp);
 }
 
 static void timer_read_on_timeout(nxe_timer* timer, nxe_data data) {
   nxd_http_server_proto* hsp=(nxd_http_server_proto*)((char*)timer-offsetof(nxd_http_server_proto, timer_read));
   //nxe_loop* loop=sub->super.loop;
   nxe_publish(&hsp->events_pub, (nxe_data)NXD_HSP_READ_TIMEOUT);
-  nxweb_log_error("connection %p read timeout", hsp);
+  nxweb_log_warning("connection %p read timeout", hsp);
 }
 
 static void timer_write_on_timeout(nxe_timer* timer, nxe_data data) {
   nxd_http_server_proto* hsp=(nxd_http_server_proto*)((char*)timer-offsetof(nxd_http_server_proto, timer_write));
   //nxe_loop* loop=sub->super.loop;
   nxe_publish(&hsp->events_pub, (nxe_data)NXD_HSP_WRITE_TIMEOUT);
-  nxweb_log_error("connection %p write timeout", hsp);
+  nxweb_log_warning("connection %p write timeout", hsp);
 }
 
 static const nxe_ostream_class data_in_class={.do_read=data_in_do_read};
@@ -519,6 +529,7 @@ void nxd_http_server_proto_setup_content_out(nxd_http_server_proto* hsp, nxweb_h
   }
   else if (resp->sendfile_fd && resp->content_length>0) {
     assert(resp->sendfile_end - resp->sendfile_offset == resp->content_length);
+    assert(!hsp->fb.fd); // must not setup fbuffer twice
     nxd_fbuffer_init(&hsp->fb, resp->sendfile_fd, resp->sendfile_offset, resp->sendfile_end);
     resp->content_out=&hsp->fb.data_out;
   }
@@ -526,6 +537,7 @@ void nxd_http_server_proto_setup_content_out(nxd_http_server_proto* hsp, nxweb_h
     resp->sendfile_fd=open(resp->sendfile_path, O_RDONLY|O_NONBLOCK);
     if (resp->sendfile_fd!=-1) {
       assert(resp->sendfile_end - resp->sendfile_offset == resp->content_length);
+      assert(!hsp->fb.fd); // must not setup fbuffer twice
       nxd_fbuffer_init(&hsp->fb, resp->sendfile_fd, resp->sendfile_offset, resp->sendfile_end);
       resp->content_out=&hsp->fb.data_out;
     }
@@ -533,6 +545,19 @@ void nxd_http_server_proto_setup_content_out(nxd_http_server_proto* hsp, nxweb_h
       nxweb_log_error("nxd_http_server_proto_start_sending_response(): can't open %s", resp->sendfile_path);
     }
   }
+}
+
+void nxweb_reset_content_out(nxd_http_server_proto* hsp, nxweb_http_response* resp) {
+  resp->content_out=0;
+  resp->content=0;
+  resp->content_length=0;
+  resp->sendfile_path=0;
+  if (resp->sendfile_fd) close(resp->sendfile_fd);
+  if (hsp->fb.fd) nxd_fbuffer_finalize(&hsp->fb);
+  resp->sendfile_fd=0;
+  resp->chunked_autoencode=0;
+  resp->chunked_encoding=0;
+  resp->gzip_encoded=0;
 }
 
 static void nxd_http_server_proto_start_sending_response(nxd_http_server_proto* hsp, nxweb_http_response* resp) {
@@ -546,6 +571,17 @@ static void nxd_http_server_proto_start_sending_response(nxd_http_server_proto* 
   nxe_loop* loop=hsp->data_in.super.loop;
   nxe_unset_timer(loop, NXWEB_TIMER_READ, &hsp->timer_read);
   if (!resp->nxb) resp->nxb=hsp->nxb;
+
+  assert(!resp->chunked_autoencode || (resp->chunked_autoencode && resp->content_length==-1));
+
+  if (req->if_modified_since && resp->last_modified
+      && resp->last_modified<=req->if_modified_since
+      && resp->status_code!=304) {
+    nxweb_log_info("responding with 304 Not Modified for %s", req->uri);
+    nxweb_reset_content_out(hsp, resp);
+    resp->status_code=304;
+    resp->status="Not Modified";
+  }
 
   if (resp->chunked_autoencode) _nxweb_encode_chunked_init(&resp->cestate);
 

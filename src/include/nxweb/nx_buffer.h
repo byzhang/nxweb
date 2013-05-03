@@ -20,6 +20,10 @@
 #ifndef NX_BUFFER_H_INCLUDED
 #define NX_BUFFER_H_INCLUDED
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <string.h>
 #include <stdarg.h>
 #include <assert.h>
@@ -61,6 +65,10 @@ static inline void* nxb_copy_obj(nxb_buffer* nxb, const void* src, int size) {
   void* obj=nxb_alloc_obj(nxb, size);
   memcpy(obj, src, size);
   return obj;
+}
+
+static inline void* nxb_copy_str(nxb_buffer* nxb, const void* src) {
+  return nxb_copy_obj(nxb, src, strlen(src)+1);
 }
 
 static inline char* nxb_finish_stream(nxb_buffer* nxb, int* size) {
@@ -148,6 +156,12 @@ static inline void nxb_append_uint_hex_zeropad(nxb_buffer* nxb, unsigned long n,
   nxb->ptr+=num_digits;
 }
 
+static inline void nxb_append_uint64_hex_zeropad(nxb_buffer* nxb, uint64_t n, int num_digits) {
+  nxb_make_room(nxb, num_digits);
+  char* p=uint64_to_hex_string_zeropad(n, nxb->ptr, num_digits, 0);
+  nxb->ptr+=num_digits;
+}
+
 static inline void nxb_blank(nxb_buffer* nxb, int size) {
   if (nxb->end - nxb->ptr < size) {
     if (nxb_realloc_chunk(nxb, size)) return;
@@ -164,4 +178,7 @@ static inline void nxb_resize_fast(nxb_buffer* nxb, int size) {
 }
 
 
+#ifdef __cplusplus
+}
+#endif
 #endif // NX_BUFFER_H_INCLUDED

@@ -38,6 +38,7 @@ typedef enum nxweb_result {
   NXWEB_OK=0,
   NXWEB_NEXT=1,
   NXWEB_ASYNC=2,
+  NXWEB_DELAY=3,
   NXWEB_ERROR=-1,
   NXWEB_REVALIDATE=-2,
   NXWEB_MISS=-3
@@ -61,23 +62,29 @@ struct nxweb_http_server_connection;
 
 typedef nxweb_result (*nxweb_handler_callback)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp);
 
+struct fc_filter_data;
+
 typedef struct nxweb_filter_data {
   const char* cache_key;
-  int cache_key_root_len;
-  struct stat cache_key_finfo;
+  struct fc_filter_data* fcache;
   unsigned bypass:1;
 } nxweb_filter_data;
 
 typedef struct nxweb_filter {
   const char* name;
-  nxweb_filter_data* (*init)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp);
-  const char* (*decode_uri)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* uri);
-  nxweb_result (*translate_cache_key)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key, int root_len);
-  nxweb_result (*serve_from_cache)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata);
-  nxweb_result (*revalidate_cache)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata);
-  nxweb_result (*do_filter)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata);
-  void (*finalize)(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata);
+  nxweb_filter_data* (*init)(struct nxweb_filter* fparam, struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp);
+  const char* (*decode_uri)(struct nxweb_filter* fparam, struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* uri);
+  nxweb_result (*translate_cache_key)(struct nxweb_filter* fparam, struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key);
+  nxweb_result (*serve_from_cache)(struct nxweb_filter* fparam, struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, time_t check_time);
+  nxweb_result (*do_filter)(struct nxweb_filter* fparam, struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata);
+  void (*finalize)(struct nxweb_filter* fparam, struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata);
 } nxweb_filter;
+
+struct fc_filter_data* _nxweb_fc_create(nxb_buffer* nxb, const char* cache_dir);
+void _nxweb_fc_init(struct fc_filter_data* fcdata, const char* cache_dir);
+void _nxweb_fc_finalize(struct fc_filter_data* fcdata);
+nxweb_result _nxweb_fc_serve_from_cache(struct nxweb_http_server_connection* conn, struct nxweb_http_request* req, struct nxweb_http_response* resp, const char* cache_key, struct fc_filter_data* fcdata, time_t check_time);
+nxweb_result _nxweb_fc_do_filter(struct nxweb_http_server_connection* conn, struct nxweb_http_request* req, struct nxweb_http_response* resp, struct fc_filter_data* fcdata);
 
 typedef struct nxweb_handler {
   const char* name;
@@ -87,20 +94,21 @@ typedef struct nxweb_handler {
   int vhost_len;
   int priority;
   nxweb_handler_flags flags;
+
+  // various handler parameters
   nxe_data param;
+  const char* host;
   const char* uri;
   const char* dir;
   const char* charset;
   const char* index_file;
-  const char* gzip_dir;
-  const char* file_cache_dir;
-  const char* img_dir;
-  const char* key;
-  const char* font;
-  const struct nxweb_image_filter_cmd* allowed_cmds;
-  _Bool cache:1;
+  nxe_ssize_t size;
+  _Bool memcache:1;
   _Bool proxy_copy_host:1;
+  _Bool secure_only:1;
+  _Bool insecure_only:1;
   int idx;
+
   struct nxweb_handler* next;
   nxweb_filter* filters[NXWEB_MAX_FILTERS];
   int num_filters;
@@ -131,6 +139,8 @@ typedef struct nxweb_http_server_listening_socket {
   nxe_subscriber listen_sub;
 } nxweb_http_server_listening_socket;
 
+#define NXWEB_ACCESS_LOG_BLOCK_SIZE 32768
+
 typedef struct nxweb_net_thread_data {
   pthread_t thread_id;
   uint8_t thread_num; // up to 256 net threads
@@ -144,6 +154,11 @@ typedef struct nxweb_net_thread_data {
   nxp_pool* free_conn_pool;
   nxp_pool* free_conn_nxb_pool;
   nxp_pool* free_rbuf_pool;
+
+  char* access_log_block;
+  int access_log_block_avail;
+  char* access_log_block_ptr;
+
   nxd_http_proxy_pool proxy_pool[NXWEB_MAX_PROXY_POOLS];
 } nxweb_net_thread_data __attribute__ ((aligned(64)));
 
@@ -165,6 +180,7 @@ typedef struct nxweb_http_server_connection {
   _Bool secure:1;
   _Bool response_ready:1;
   _Bool subrequest_failed:1;
+  uint64_t uid; // unique connection id
   struct nxweb_http_server_connection* parent;
   struct nxweb_http_server_connection* subrequests;
   struct nxweb_http_server_connection* next;
@@ -195,6 +211,11 @@ struct nxweb_server_config {
   nxweb_handler_callback request_dispatcher;
   nxweb_handler* handler_list;
   nxweb_module* module_list;
+  int shutdown_timeout; // time in secs to close up after SIGTERM
+  char* work_dir;
+  const char* access_log_fpath;
+  int access_log_fd;
+  pthread_mutex_t access_log_start_mux;
 };
 
 typedef struct nxweb_image_filter_cmd {
@@ -209,6 +230,7 @@ typedef struct nxweb_image_filter_cmd {
   char color[8]; // "#FF00AA\0"
   char* cmd_string;
   const char* query_string;
+  const char* uri_path;
   const nxweb_mime_type* mtype;
 } nxweb_image_filter_cmd;
 
@@ -228,6 +250,8 @@ int nxweb_select_handler(nxweb_http_server_connection* conn, nxweb_http_request*
           _nxweb_register_module(&_nxweb_ ## _name ## _module); \
         }
 
+// Old-style (pre 3.2) handler setup macros:
+
 #define NXWEB_HANDLER(_name, _prefix, ...) \
         static nxweb_handler _nxweb_ ## _name ## _handler={.name=#_name, .prefix=_prefix, ## __VA_ARGS__}; \
         static void _nxweb_pre_load_handler_ ## _name() __attribute__ ((constructor)); \
@@ -241,6 +265,26 @@ int nxweb_select_handler(nxweb_http_server_connection* conn, nxweb_http_request*
         static void _nxweb_pre_load_handler_ ## _name() { \
           _nxweb_register_handler(&_nxweb_ ## _name ## _handler, (_base)); \
         }
+
+// New style (3.2+) setup macros (use inside server_config() callback function):
+
+#define NXWEB_HANDLER_SETUP(_name, _prefix, _base, ...) \
+        nxweb_handler _nxweb_ ## _name ## _handler={.name=#_name, .prefix=(_prefix), ## __VA_ARGS__}; \
+        _nxweb_register_handler(&_nxweb_ ## _name ## _handler, (_base))
+
+#define NXWEB_SENDFILE_SETUP(_name, _prefix, ...) \
+        nxweb_handler _nxweb_ ## _name ## _handler={.name=#_name, .prefix=(_prefix), ## __VA_ARGS__}; \
+        _nxweb_register_handler(&_nxweb_ ## _name ## _handler, &nxweb_sendfile_handler)
+
+#define NXWEB_PROXY_SETUP(_name, _prefix, ...) \
+        nxweb_handler _nxweb_ ## _name ## _handler={.name=#_name, .prefix=(_prefix), ## __VA_ARGS__}; \
+        _nxweb_register_handler(&_nxweb_ ## _name ## _handler, &nxweb_http_proxy_handler)
+
+#ifdef WITH_PYTHON
+#define NXWEB_PYTHON_SETUP(_name, _prefix, ...) \
+        nxweb_handler _nxweb_ ## _name ## _handler={.name=#_name, .prefix=(_prefix), ## __VA_ARGS__}; \
+        _nxweb_register_handler(&_nxweb_ ## _name ## _handler, &nxweb_python_handler)
+#endif
 
 void nxweb_start_sending_response(nxweb_http_server_connection* conn, nxweb_http_response* resp);
 
@@ -265,8 +309,6 @@ static inline uint64_t nxweb_generate_unique_id() {
 
 nxweb_result nxweb_cache_try(nxweb_http_server_connection* conn, nxweb_http_response* resp, const char* key, time_t if_modified_since, time_t revalidated_mtime);
 nxweb_result nxweb_cache_store_response(nxweb_http_server_connection* conn, nxweb_http_response* resp);
-
-extern nxweb_handler nxweb_http_proxy_handler;
 
 #ifdef	__cplusplus
 }

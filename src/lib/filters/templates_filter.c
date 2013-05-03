@@ -33,10 +33,11 @@ typedef struct tf_buffer {
 
 typedef struct tf_filter_data {
   nxweb_filter_data fdata;
-  tf_buffer tfb;
+  tf_buffer* tfb;
   nxweb_composite_stream* cs;
   int input_fd;
-  nxt_context ctx;
+  time_t last_modified;
+  nxt_context* ctx;
   nxweb_http_server_connection* conn;
 } tf_filter_data;
 
@@ -62,13 +63,24 @@ static const char tfb_key; // variable's address only matters
 #define TFB_KEY ((nxe_data)&tfb_key)
 
 static void tf_check_complete(tf_filter_data* tfdata) {
-  nxt_context* ctx=&tfdata->ctx;
+  nxt_context* ctx=tfdata->ctx;
   if (nxt_is_complete(ctx)) {
     // merge
     nxt_merge(ctx);
     // serialize
     nxt_serialize_to_cs(ctx, tfdata->cs);
     nxweb_composite_stream_close(tfdata->cs);
+
+    nxweb_http_request* req=&tfdata->conn->hsp.req;
+    nxweb_http_response* resp=tfdata->conn->hsp.resp;
+
+    resp->last_modified=tfdata->last_modified;
+    if (req->if_modified_since && resp->last_modified && resp->last_modified<=req->if_modified_since) {
+      nxweb_reset_content_out(&tfdata->conn->hsp, resp);
+      resp->status_code=304;
+      resp->status="Not Modified";
+    }
+    nxweb_start_sending_response(tfdata->conn, resp);
   }
 }
 
@@ -97,7 +109,7 @@ static nxe_ssize_t tf_buffer_data_in_write(nxe_ostream* os, nxe_istream* is, int
     nxe_ostream_unset_ready(os);
 
     tf_filter_data* tfdata=tfb->tfdata;
-    nxt_context* ctx=&tfdata->ctx;
+    nxt_context* ctx=tfdata->ctx;
     if (tfb->overflow) {
       nxweb_log_error("MAX_TEMPLATE_SIZE exceeded");
       nxb_unfinish_stream(tfb->nxb);
@@ -154,13 +166,23 @@ static void tf_on_subrequest_ready(nxe_data data) {
 
   int status=resp->status_code;
   if (!subconn->subrequest_failed && (!status || status==200)) {
-    if (resp->content_length>0) tf_buffer_make_room(tfb, min(MAX_TEMPLATE_SIZE, resp->content_length));
-    nxe_connect_streams(subconn->tdata->loop, subconn->hsp.resp->content_out, &tfb->data_in);
+    if (tfdata->last_modified) {
+      if (!resp->last_modified) tfdata->last_modified=0;
+      else if (resp->last_modified > tfdata->last_modified) tfdata->last_modified=resp->last_modified;
+    }
+    if (resp->content_length==0) {
+      tfdata->ctx->files_pending--;
+      tf_check_complete(tfdata);
+    }
+    else {
+      if (resp->content_length>0) tf_buffer_make_room(tfb, min(MAX_TEMPLATE_SIZE, resp->content_length));
+      nxe_connect_streams(subconn->tdata->loop, subconn->hsp.resp->content_out, &tfb->data_in);
+    }
   }
   else {
     // subrequest error
-    nxweb_log_error("subrequest failed: %s%s", subconn->hsp.req.host, subconn->hsp.req.uri);
-    tfdata->ctx.files_pending--;
+    nxweb_log_warning("subrequest failed: %s%s", subconn->hsp.req.host, subconn->hsp.req.uri);
+    tfdata->ctx->files_pending--;
     tf_check_complete(tfdata);
   }
 }
@@ -171,7 +193,7 @@ static void tf_subreq_finalize(nxweb_http_server_connection* conn, nxweb_http_re
 }
 
 static int tf_load(nxt_context* ctx, const char* uri, nxt_file* dst_file, nxt_block* dst_block) { // function to make subrequests
-  tf_filter_data* tfdata=OBJ_PTR_FROM_FLD_PTR(tf_filter_data, ctx, ctx);
+  tf_filter_data* tfdata=ctx->loader_data.ptr;
   tf_buffer* tfb=nxb_calloc_obj(ctx->nxb, sizeof(tf_buffer));
   if (dst_block) {
     // nxweb_log_error("including file %s", uri);
@@ -188,53 +210,31 @@ static int tf_load(nxt_context* ctx, const char* uri, nxt_file* dst_file, nxt_bl
   if (dst_file) subreq->templates_no_parse=1;
 }
 
-static nxweb_filter_data* tf_init(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
+static nxweb_filter_data* tf_init(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
+  if (req->templates_no_parse) return 0; // bypass
   nxweb_filter_data* fdata=nxb_calloc_obj(req->nxb, sizeof(tf_filter_data));
   return fdata;
 }
 
-static void tf_finalize(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+static void tf_finalize(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
   tf_filter_data* tfdata=(tf_filter_data*)fdata;
-  if (tfdata->tfb.data_in.pair) nxe_disconnect_streams(tfdata->tfb.data_in.pair, &tfdata->tfb.data_in);
+  if (tfdata->tfb && tfdata->tfb->data_in.pair) nxe_disconnect_streams(tfdata->tfb->data_in.pair, &tfdata->tfb->data_in);
   if (tfdata->input_fd) {
     close(tfdata->input_fd);
     tfdata->input_fd=0;
   }
 }
 
-static nxweb_result tf_translate_cache_key(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key, int root_len) {
-  if (req->templates_no_parse) {
-    fdata->bypass=1;
-    return NXWEB_NEXT;
-  }
-  if (!resp->templates_on) {
-    if (*resp->cache_key!=' ') { // response originally comes from file
-      if (!resp->mtype && *key!=' ') {
-        resp->mtype=nxweb_get_mime_type_by_ext(key); // always returns not null
-      }
-      if (!resp->mtype && resp->content_type) {
-        resp->mtype=nxweb_get_mime_type(resp->content_type);
-      }
-    }
-    if (resp->mtype && !resp->mtype->templates_on) {
-      fdata->bypass=1;
-      return NXWEB_NEXT;
-    }
-  }
-
-  // transform to virtual key ( )
-  int plen=strlen(key)-root_len;
-  assert(plen>=0);
-  int rlen=sizeof(" /_tf_")-1;
-  char* fc_key=nxb_alloc_obj(req->nxb, rlen+plen+1);
-  memcpy(fc_key, " /_tf_", rlen);
-  strcpy(fc_key+rlen, key+root_len);
-  fdata->cache_key=fc_key;
-  fdata->cache_key_root_len=1;
+static nxweb_result tf_translate_cache_key(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key) {
+  int key_len=strlen(key);
+  char* tf_key=nxb_alloc_obj(req->nxb, key_len+5+1);
+  memcpy(tf_key, key, key_len);
+  strcpy(tf_key+key_len, "$tmpl");
+  fdata->cache_key=tf_key;
   return NXWEB_OK;
 }
 
-static nxweb_result tf_do_filter(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+static nxweb_result tf_do_filter(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
   tf_filter_data* tfdata=(tf_filter_data*)fdata;
   if (resp->status_code && resp->status_code!=200) return NXWEB_OK;
 
@@ -253,15 +253,19 @@ static nxweb_result tf_do_filter(struct nxweb_http_server_connection* conn, nxwe
     }
   }
 
+  resp->templates_on=0; // clear it for other filters following in chain
+
   nxd_http_server_proto_setup_content_out(&conn->hsp, resp);
 
   tfdata->conn=conn;
-  nxt_init(&tfdata->ctx, req->nxb, tf_load);
-  tf_buffer_init(&tfdata->tfb, req->nxb, tfdata, nxt_file_create(&tfdata->ctx, req->uri), 0);
+  tfdata->ctx=nxb_alloc_obj(req->nxb, sizeof(nxt_context));
+  nxt_init(tfdata->ctx, req->nxb, tf_load, (nxe_data)(void*)tfdata);
+  tfdata->tfb=nxb_calloc_obj(req->nxb, sizeof(tf_buffer));
+  tf_buffer_init(tfdata->tfb, req->nxb, tfdata, nxt_file_create(tfdata->ctx, req->uri), 0);
 
   // attach content_out to tf_buffer
-  if (resp->content_length>0) tf_buffer_make_room(&tfdata->tfb, min(MAX_TEMPLATE_SIZE, resp->content_length));
-  nxe_connect_streams(conn->tdata->loop, resp->content_out, &tfdata->tfb.data_in);
+  if (resp->content_length>0) tf_buffer_make_room(tfdata->tfb, min(MAX_TEMPLATE_SIZE, resp->content_length));
+  nxe_connect_streams(conn->tdata->loop, resp->content_out, &tfdata->tfb->data_in);
 
   // replace content_out with composite stream
   nxweb_composite_stream* cs=nxweb_composite_stream_init(conn, req);
@@ -276,11 +280,11 @@ static nxweb_result tf_do_filter(struct nxweb_http_server_connection* conn, nxwe
     tfdata->input_fd=resp->sendfile_fd;
     resp->sendfile_fd=0;
   }
-  resp->last_modified=0;
 
   tfdata->cs=cs;
+  tfdata->last_modified=resp->last_modified;
 
-  return NXWEB_OK;
+  return NXWEB_DELAY; // don't start sending; wait for all subrequests complete, so we can calculate last_modified
 }
 
 nxweb_filter templates_filter={.name="templates", .init=tf_init, .finalize=tf_finalize,

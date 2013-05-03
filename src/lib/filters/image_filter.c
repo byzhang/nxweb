@@ -73,7 +73,6 @@
 #define CMD_SIGN_SECRET_KEY "XbLBZeqSsUgfKWooMKoh0r1gjzqG856yVCMLf1pz"
 
 #define WATERMARK_FILE_NAME "watermark.png"
-#define MAX_PATH 1024
 
 #ifndef max
 #define max(a,b) \
@@ -88,6 +87,13 @@
        __typeof__ (b) _b = (b); \
      _a < _b ? _a : _b; })
 #endif
+
+typedef struct nxweb_filter_image {
+  nxweb_filter base;
+  const char* cache_dir;
+  nxweb_image_filter_cmd* allowed_cmds;
+  const char* sign_key;
+} nxweb_filter_image;
 
 /**
  * Only commands listed below will be allowed (to protect from DoS).
@@ -123,9 +129,9 @@ static void image_filter_finalize() {
 
 NXWEB_MODULE(image_filter, .on_server_startup=image_filter_init, .on_server_shutdown=image_filter_finalize);
 
-static int locate_watermark(const char* fpath, const char* path_info, char* wpath) {
+static int locate_watermark(const char* fpath, int doc_root_len, char* wpath) {
   strcpy(wpath, fpath);
-  const char* wpath_info=wpath+(path_info-fpath);
+  const char* wpath_info=wpath+doc_root_len;
   char* p;
   struct stat finfo;
   while ((p=strrchr(wpath_info, '/'))) {
@@ -138,7 +144,62 @@ static int locate_watermark(const char* fpath, const char* path_info, char* wpat
   return 0; // not found
 }
 
-static int process_cmd(const char* fpath, const char* path_info, MagickWand* image, nxweb_image_filter_cmd* cmd) {
+static void parse_crop_offset(const char* instr, size_t len, int* x, int *y) {
+  // offset format: "co:100,-120"
+  *x=*y=0;
+  if (!instr || len<6) return;
+  if (instr[0]!='c' || instr[1]!='o' || instr[2]!=':') return; // prefix "co:"
+  char buf[16];
+  len-=3;
+  if (len>sizeof(buf)-1) return;
+  strncpy(buf, instr+3, len);
+  buf[len]='\0';
+  char* p=buf;
+  while (*p!=',') {
+    if (!*p++) return;
+  }
+  *p++='\0';
+  if (!*p) return;
+  *x=atoi(buf);
+  *y=atoi(p);
+}
+
+static char* find_iptc_record(unsigned char* profile, size_t size, unsigned char record_id, unsigned char tag_id, size_t* len) {
+  unsigned char* p=profile;
+  unsigned char* end=p+size;
+  // http://www.iptc.org/std/IIM/4.1/specification/IIMV4.1.pdf
+  while (p+5<=end) {
+    if (*p++!=0x1c) break; // wrong marker; corrupted record
+    unsigned char rid=*p++;
+    unsigned char tid=*p++;
+    int sz=*p++;
+    sz=(sz<<8)|*p++;
+    if (sz&0x8000) { // extended tag
+      break; // not supported
+    }
+    if (p+sz>end) break; // overflow; corrupted record
+    if (rid==record_id && tid==tag_id) {
+      *len=sz;
+      return p;
+    }
+    p+=sz;
+  }
+  return 0;
+}
+
+static void find_crop_offset(MagickWand* image, int* x, int* y) {
+  *x=*y=0;
+  size_t len;
+  char* profile=MagickGetImageProfile(image, "iptc", &len);
+  if (profile) {
+    char* v=find_iptc_record(profile, len, 2, 0x28, &len); // "Iptc.Application2.SpecialInstructions"
+    if (v) {
+      parse_crop_offset(v, len, x, y);
+    }
+  }
+}
+
+static int process_cmd(const char* fpath, int doc_root_len, MagickWand* image, nxweb_image_filter_cmd* cmd) {
   int width=MagickGetImageWidth(image);
   int height=MagickGetImageHeight(image);
   if (width<=0 || height<=0) {
@@ -176,19 +237,49 @@ static int process_cmd(const char* fpath, const char* path_info, MagickWand* ima
       MagickResizeImage(image, width, height, LanczosFilter, 1);
       dirty=1;
     }
-    if (width!=max_width || height!=max_height) {
-      PixelWand* pwand=NewPixelWand();
-      char* format=MagickGetImageFormat(image); // returns "JPEG", "GIF", or "PNG"
-      _Bool supports_transparency=*format!='J'; // only JPEG does not support transparency
-      MagickRelinquishMemory(format);
-      PixelSetColor(pwand, cmd->color[0]? cmd->color : (supports_transparency?"none":"white"));
-      MagickSetImageBackgroundColor(image, pwand);
-      int offset_x=cmd->gravity_left? 0 : (cmd->gravity_right? -(max_width-width) : -(max_width-width)/2);
-      int offset_y=cmd->gravity_top? 0 : (cmd->gravity_bottom? -(max_height-height) : -(max_height-height)/2);
+    if (width!=max_width || height!=max_height) { // need to crop or extend
+      int crop_offset_x, crop_offset_y;
+      find_crop_offset(image, &crop_offset_x, &crop_offset_y);
+      if ((crop_offset_x || crop_offset_y) && scale<1.) {
+        crop_offset_x=round(scale*crop_offset_x);
+        crop_offset_y=round(scale*crop_offset_y);
+      }
+      if (cmd->gravity_left) crop_offset_x=-width;
+      else if (cmd->gravity_right) crop_offset_x=width;
+      if (cmd->gravity_top) crop_offset_y=-height;
+      else if (cmd->gravity_bottom) crop_offset_y=height;
+      PixelWand* pwand=0;
+      if (max_width>width || max_height>height) {
+        pwand=NewPixelWand();
+        char* format=MagickGetImageFormat(image); // returns "JPEG", "GIF", or "PNG"
+        _Bool supports_transparency=*format!='J'; // only JPEG does not support transparency
+        MagickRelinquishMemory(format);
+        PixelSetColor(pwand, cmd->color[0]? cmd->color : (supports_transparency?"none":"white"));
+        MagickSetImageBackgroundColor(image, pwand);
+      }
+      int offset_x, offset_y;
+      int cut_x=width-max_width;
+      if (cut_x<=0) {
+        offset_x=cut_x/2;
+      }
+      else {
+        offset_x=cut_x/2 + crop_offset_x;
+        if (offset_x<0) offset_x=0;
+        else if (offset_x>cut_x) offset_x=cut_x;
+      }
+      int cut_y=height-max_height;
+      if (cut_y<=0) {
+        offset_y=cut_y/2;
+      }
+      else {
+        offset_y=cut_y/2 + crop_offset_y;
+        if (offset_y<0) offset_y=0;
+        else if (offset_y>cut_y) offset_y=cut_y;
+      }
       MagickExtentImage(image, max_width, max_height, offset_x, offset_y);
       width=max_width;
       height=max_height;
-      DestroyPixelWand(pwand);
+      if (pwand) DestroyPixelWand(pwand);
       dirty=1;
     }
   }
@@ -225,7 +316,8 @@ static int process_cmd(const char* fpath, const char* path_info, MagickWand* ima
   }
   if (!cmd->dont_watermark && width>=200 && height>=200) { // don't watermark images smaller than 200x200
     char wpath[2096];
-    if (locate_watermark(fpath, path_info, wpath)) {
+    assert(strlen(fpath)<sizeof(wpath));
+    if (locate_watermark(fpath, doc_root_len, wpath)) {
       MagickWand* watermark=NewMagickWand();
       MagickReadImage(watermark, wpath);
       int wwidth=MagickGetImageWidth(watermark);
@@ -245,7 +337,7 @@ static int process_cmd(const char* fpath, const char* path_info, MagickWand* ima
       MagickGetImagePage(watermark, &wpage_width, &wpage_height, &woffset_x, &woffset_y);
       woffset_x=(int32_t)woffset_x;
       woffset_y=(int32_t)woffset_y;
-      nxweb_log_error("watermark found: %s size %dx%d page %ldx%ld offs %ldx%ld", wpath, wwidth, wheight, wpage_width, wpage_height, woffset_x, woffset_y);
+      nxweb_log_info("watermark found: %s size %dx%d page %ldx%ld offs %ldx%ld", wpath, wwidth, wheight, wpage_width, wpage_height, woffset_x, woffset_y);
       if (wpage_width>wwidth && wpage_height>wheight) { // page defined => watermark file has layout
         if (width<wpage_width || height<wpage_height) { // scale watermark down
           double scale_x=(double)width/(double)wpage_width;
@@ -379,6 +471,7 @@ static int decode_cmd(char* uri, nxweb_image_filter_cmd* cmd, nxb_buffer* nxb) {
   cmd->cmd_string=nxb_copy_obj(nxb, cc, cmd_string_len+1);
   cmd->cmd_string[cmd_string_len]='\0';
   if (q) cmd->query_string=nxb_copy_obj(nxb, q+1, strlen(q));
+  cmd->uri_path=nxb_copy_obj(nxb, uri, q? q-uri : strlen(uri));
   //*q='\0';
   memmove(cc, ext, strlen(ext)+1);
   fnlen-=cmd_string_len;
@@ -456,148 +549,186 @@ static void sha1sign(const char* str, unsigned str_len, const char* key, char* r
 
 typedef struct img_filter_data {
   nxweb_filter_data fdata;
+  nxd_fbuffer fb;
   nxweb_image_filter_cmd cmd;
 } img_filter_data;
 
-static nxweb_filter_data* img_init(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
+static nxweb_filter_data* img_init(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp) {
   nxweb_filter_data* fdata=nxb_calloc_obj(req->nxb, sizeof(img_filter_data));
   return fdata;
 }
 
-static const char* img_decode_uri(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* uri) {
+static void img_finalize(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+  img_filter_data* ifdata=(img_filter_data*)fdata;
+  nxd_fbuffer_finalize(&ifdata->fb);
+}
+
+static const char* img_decode_uri(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* uri) {
   img_filter_data* ifdata=(img_filter_data*)fdata;
   char* uri_copy=nxb_copy_obj(req->nxb, uri, strlen(uri)+1);
   decode_cmd(uri_copy, &ifdata->cmd, req->nxb);
-  if (!ifdata->cmd.mtype || !ifdata->cmd.mtype->image) fdata->bypass=1;
+  if (!ifdata->cmd.mtype || !ifdata->cmd.mtype->image) {
+    fdata->bypass=1;
+    return uri;
+  }
   return uri_copy;
 }
 
-static nxweb_result img_translate_cache_key(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* key, int root_len) {
-  // if filter does not store its own cache file
-  // it must not store cache_key and just return NXWEB_NEXT
-  // it must not implement serve_from_cache either
-  if (!*key) return NXWEB_OK;
-  if (*key==' ') { // virtual key
-    fdata->bypass=1;
-    return NXWEB_NEXT;
-  }
-  assert(conn->handler->img_dir);
+static nxweb_result img_translate_cache_key(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata, const char* cache_key) {
   img_filter_data* ifdata=(img_filter_data*)fdata;
-  int plen=strlen(key)-root_len;
-  int rlen=strlen(conn->handler->img_dir);
-  int cmd_len=ifdata->cmd.cmd_string? strlen(ifdata->cmd.cmd_string) : 0;
-  char* img_key=nxb_calloc_obj(req->nxb, rlen+plen+cmd_len+1);
-  strcpy(img_key, conn->handler->img_dir);
-  strcpy(img_key+rlen, key+root_len);
-  const char* ext=strrchr(key+root_len, '.');
-  assert(ext);
-  int ext_len=plen+root_len-(ext-key);
-  if (cmd_len) strcpy(img_key+rlen+plen-ext_len, ifdata->cmd.cmd_string);
-  strcpy(img_key+rlen+plen-ext_len+cmd_len, ext);
-  fdata->cache_key=img_key;
-  fdata->cache_key_root_len=rlen;
+  if (!ifdata->cmd.cmd_string) {
+    fdata->cache_key=cache_key;
+    return NXWEB_OK;
+  }
+  // append previously extracted cmd_string
+  nxb_buffer* nxb=req->nxb;
+  nxb_append_str(nxb, cache_key);
+  nxb_append_str(nxb, "$img");
+  nxb_append_str(nxb, ifdata->cmd.cmd_string);
+  nxb_append_char(nxb, '\0');
+  fdata->cache_key=nxb_finish_stream(nxb, 0);
   return NXWEB_OK;
 }
 
-static nxweb_result img_serve_from_cache(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
-  nxweb_send_file(resp, (char*)fdata->cache_key, fdata->cache_key_root_len, &fdata->cache_key_finfo, 0, 0, 0, resp->mtype, conn->handler->charset);
-  return NXWEB_OK;
-}
-
-static nxweb_result img_do_filter(struct nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+static nxweb_result img_do_filter(nxweb_filter* filter, nxweb_http_server_connection* conn, nxweb_http_request* req, nxweb_http_response* resp, nxweb_filter_data* fdata) {
+  img_filter_data* ifdata=(img_filter_data*)fdata;
   if (resp->status_code && resp->status_code!=200) return NXWEB_OK;
   assert(fdata->cache_key);
   assert(resp->sendfile_path);
   assert(resp->content_length>0 && resp->sendfile_offset==0 && resp->sendfile_end==resp->sendfile_info.st_size &&  resp->sendfile_end==resp->content_length);
-  int rlen=fdata->cache_key_root_len;
-  const char* fpath=fdata->cache_key;
-  img_filter_data* ifdata=(img_filter_data*)fdata;
 
-  if (ifdata->cmd.cmd) {
-    // check if cmd is allowed
-    const nxweb_image_filter_cmd* ac=conn->handler->allowed_cmds? conn->handler->allowed_cmds : allowed_cmds;
-    _Bool allowed=0;
-    while (ac->cmd) {
-      if (ifdata->cmd.cmd==ac->cmd && ifdata->cmd.width==ac->width && ifdata->cmd.height==ac->height
-              && ifdata->cmd.gravity_top==ac->gravity_top && ifdata->cmd.gravity_bottom==ac->gravity_bottom
-              && ifdata->cmd.gravity_left==ac->gravity_left && ifdata->cmd.gravity_right==ac->gravity_right
-              && !strcmp(ifdata->cmd.color, ac->color)) {
-        allowed=1;
-        break;
+  assert(((nxweb_filter_image*)filter)->cache_dir);
+  nxb_buffer* nxb=req->nxb;
+  nxb_append_str(nxb, ((nxweb_filter_image*)filter)->cache_dir);
+  const char* cache_key=ifdata->fdata.cache_key;
+  if (cache_key[0]=='.' && cache_key[1]=='.' && cache_key[2]=='/') cache_key+=2; // avoid going up dir tree
+  if (*cache_key!='/') nxb_append_char(nxb, '/');
+  nxb_append_str(nxb, cache_key);
+  nxb_append_char(nxb, '\0');
+  /*
+  int cmd_len=ifdata->cmd.cmd_string? strlen(ifdata->cmd.cmd_string) : 0;
+  nxb_blank(nxb, cmd_len);
+  */
+  char* fpath=nxb_finish_stream(req->nxb, 0);
+  /*
+  if (cmd_len) {
+    char* ext=strrchr(fpath, '.');
+    int ext_len=strlen(ext);
+    assert(ext);
+    memmove(ext+cmd_len, ext, ext_len+1);
+    memcpy(ext, ifdata->cmd.cmd_string, cmd_len);
+  }
+  */
+  struct stat finfo;
+
+  if (stat(fpath, &finfo)==-1 || finfo.st_mtime!=resp->sendfile_info.st_mtime) {
+    if (ifdata->cmd.cmd) {
+      // check if cmd is allowed
+      const nxweb_image_filter_cmd* ac=((nxweb_filter_image*)filter)->allowed_cmds;
+      _Bool allowed=0;
+      while (ac->cmd) {
+        if (ifdata->cmd.cmd==ac->cmd && ifdata->cmd.width==ac->width && ifdata->cmd.height==ac->height
+                && ifdata->cmd.gravity_top==ac->gravity_top && ifdata->cmd.gravity_bottom==ac->gravity_bottom
+                && ifdata->cmd.gravity_left==ac->gravity_left && ifdata->cmd.gravity_right==ac->gravity_right
+                && !strcmp(ifdata->cmd.color, ac->color)) {
+          allowed=1;
+          break;
+        }
+        ac++;
       }
-      ac++;
+      if (!allowed && ifdata->cmd.query_string) {
+        char signature[41];
+        sha1sign(ifdata->cmd.uri_path, strlen(ifdata->cmd.uri_path), ((nxweb_filter_image*)filter)->sign_key, signature);
+        if (!strcmp(ifdata->cmd.query_string, signature)) allowed=1;
+        else nxweb_log_warning("img cmd not allowed: path=%s sha1sign=%s query_string=%s", ifdata->cmd.uri_path, signature, ifdata->cmd.query_string);
+      }
+      if (!allowed) {
+        nxweb_send_http_error(resp, 403, "Forbidden");
+        return NXWEB_ERROR;
+      }
     }
-    if (!allowed && ifdata->cmd.query_string) {
-      char signature[41];
-      sha1sign(fpath+rlen, strlen(fpath+rlen), conn->handler->key? conn->handler->key : CMD_SIGN_SECRET_KEY, signature);
-      nxweb_log_error("path=%s sha1sign=%s query_string=%s", fpath+rlen, signature, ifdata->cmd.query_string);
-      if (!strcmp(ifdata->cmd.query_string, signature)) allowed=1;
-    }
-    if (!allowed) {
-      nxweb_send_http_error(resp, 403, "Forbidden");
+
+    if (nxweb_mkpath((char*)fpath, 0755)<0) {
+      nxweb_log_error("nxweb_mkpath(%s) failed", fpath);
       return NXWEB_ERROR;
     }
-  }
 
-  if (nxweb_mkpath((char*)fpath, 0755)<0) {
-    nxweb_log_error("nxweb_mkpath(%s) failed", fpath);
-    return NXWEB_ERROR;
-  }
+    if (resp->sendfile_fd>0) {
+      close(resp->sendfile_fd);
+    }
+    resp->sendfile_fd=0;
 
-  if (resp->sendfile_fd>0) {
-    close(resp->sendfile_fd);
-  }
-  resp->sendfile_fd=0;
-
-  MagickWand* image=NewMagickWand();
-  if (!MagickReadImage(image, resp->sendfile_path)) {
-    DestroyMagickWand(image);
-    nxweb_log_error("MagickReadImage(%s) failed", resp->sendfile_path);
-    nxweb_send_http_error(resp, 500, "Internal Server Error");
-    return NXWEB_ERROR;
-  }
-  MagickStripImage(image);
-
-  if (process_cmd(resp->sendfile_path, resp->sendfile_path+resp->sendfile_path_root_len, image, &ifdata->cmd)) {
-    nxweb_log_error("writing image file %s", fpath);
-    if (!MagickWriteImage(image, fpath)) {
+    MagickWand* image=NewMagickWand();
+    if (!MagickReadImage(image, resp->sendfile_path)) {
       DestroyMagickWand(image);
-      nxweb_log_error("MagickWriteImage(%s) failed", fpath);
+      nxweb_log_error("MagickReadImage(%s) failed", resp->sendfile_path);
       nxweb_send_http_error(resp, 500, "Internal Server Error");
       return NXWEB_ERROR;
     }
-    DestroyMagickWand(image);
+
+    if (process_cmd(resp->sendfile_path, conn->handler->dir? strlen(conn->handler->dir) : 0, image, &ifdata->cmd)) {
+      nxweb_log_info("writing image file %s", fpath);
+      MagickStripImage(image);
+      if (!MagickWriteImage(image, fpath)) {
+        DestroyMagickWand(image);
+        nxweb_log_error("MagickWriteImage(%s) failed", fpath);
+        nxweb_send_http_error(resp, 500, "Internal Server Error");
+        return NXWEB_ERROR;
+      }
+      DestroyMagickWand(image);
+    }
+    else {
+      // processing changed nothing => just copy the original
+      DestroyMagickWand(image);
+      nxweb_log_info("copying image file %s", fpath);
+      if (copy_file(resp->sendfile_path, fpath)) {
+        nxweb_log_error("error %d copying image file %s", errno, fpath);
+        nxweb_send_http_error(resp, 500, "Internal Server Error");
+        return NXWEB_ERROR;
+      }
+    }
+
+    struct utimbuf ut={.actime=resp->sendfile_info.st_atime, .modtime=resp->sendfile_info.st_mtime};
+    utime(fpath, &ut);
+
+    nxweb_log_info("image processed %s -> %s", resp->sendfile_path, fpath);
+    if (stat(fpath, &resp->sendfile_info)==-1) {
+      nxweb_log_error("can't stat processed image %s", fpath);
+      return NXWEB_ERROR;
+    }
   }
   else {
-    // processing changed nothing => just copy the original
-    DestroyMagickWand(image);
-    nxweb_log_error("copying image file %s", fpath);
-    if (copy_file(resp->sendfile_path, fpath)) {
-      nxweb_log_error("error %d copying image file %s", errno, fpath);
-      nxweb_send_http_error(resp, 500, "Internal Server Error");
-      return NXWEB_ERROR;
-    }
+    resp->sendfile_info=finfo;
   }
-
-  struct utimbuf ut={.actime=resp->sendfile_info.st_atime, .modtime=resp->sendfile_info.st_mtime};
-  utime(fpath, &ut);
-
-  nxweb_log_error("image processed %s -> %s", resp->sendfile_path, fpath);
 
   resp->sendfile_path=fpath;
-  resp->sendfile_path_root_len=rlen;
-  if (stat(fpath, &resp->sendfile_info)==-1) {
-    nxweb_log_error("can't stat processed image %s", fpath);
-    return NXWEB_ERROR;
-  }
   resp->sendfile_end=
   resp->content_length=resp->sendfile_info.st_size;
   resp->last_modified=resp->sendfile_info.st_mtime;
-  resp->content_out=0; // reset content_out
   resp->content=0;
+
+  resp->sendfile_fd=open(resp->sendfile_path, O_RDONLY|O_NONBLOCK);
+  if (resp->sendfile_fd!=-1) {
+    nxd_fbuffer_init(&ifdata->fb, resp->sendfile_fd, resp->sendfile_offset, resp->sendfile_end);
+    resp->content_out=&ifdata->fb.data_out;
+  }
+  else {
+    nxweb_log_error("nxd_http_server_proto_start_sending_response(): can't open %s", resp->sendfile_path);
+  }
+
   return NXWEB_OK;
 }
 
-nxweb_filter image_filter={.name="image", .init=img_init, .translate_cache_key=img_translate_cache_key,
-        .decode_uri=img_decode_uri, .serve_from_cache=img_serve_from_cache, .do_filter=img_do_filter};
+static nxweb_filter_image image_filter={.base={.name="image", .init=img_init, .finalize=img_finalize,
+        .translate_cache_key=img_translate_cache_key,
+        .decode_uri=img_decode_uri, .do_filter=img_do_filter},
+        .allowed_cmds=allowed_cmds, .sign_key=CMD_SIGN_SECRET_KEY};
 
+nxweb_filter* nxweb_image_filter_setup(const char* cache_dir, nxweb_image_filter_cmd* allowed_cmds, const char* sign_key) {
+  nxweb_filter_image* f=nx_alloc(sizeof(nxweb_filter_image)); // NOTE this will never be freed
+  *f=image_filter;
+  f->cache_dir=cache_dir;
+  if (allowed_cmds) f->allowed_cmds=allowed_cmds;
+  if (sign_key) f->sign_key=sign_key;
+  return (nxweb_filter*)f;
+}

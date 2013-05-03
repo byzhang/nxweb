@@ -1,4 +1,4 @@
-# Copyright (c) 2011-2012 Yaroslav Stavnichiy <yarosla@gmail.com>
+# Copyright (c) 2011-2013 Yaroslav Stavnichiy <yarosla@gmail.com>
 #
 # This file is part of NXWEB.
 #
@@ -15,12 +15,14 @@
 # You should have received a copy of the GNU Lesser General Public
 # License along with NXWEB. If not, see <http://www.gnu.org/licenses/>.
 
-AC_INIT([nxweb], [3.1.0-dev])
+AC_INIT([nxweb], [3.2.0-dev])
 AC_CONFIG_HEADER(src/include/nxweb/config.h)
 AC_CONFIG_MACRO_DIR([m4])
 AM_INIT_AUTOMAKE
 AC_PROG_CC([gcc])
 AC_PROG_LIBTOOL
+
+m4_include([m4/m4_ax_python_devel.m4])
 
 AC_CANONICAL_HOST
 case $host_os in
@@ -62,7 +64,7 @@ then
     AC_SUBST(IMAGEMAGICK_BIN_DIR)
   fi
   echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-  PKG_CHECK_MODULES([IMAGEMAGICK], [MagickWand >= 6.6.0], [AC_DEFINE([WITH_IMAGEMAGICK], [1], [Use IMAGEMAGICK])])
+  PKG_CHECK_MODULES([IMAGEMAGICK], [MagickWand >= 6.5.0], [AC_DEFINE([WITH_IMAGEMAGICK], [1], [Use IMAGEMAGICK])])
   #IMAGEMAGICK_LIBS+=" -lMagickWand -lMagickCore"
   #AC_SUBST(IMAGEMAGICK_LIBS)
   echo "IMAGEMAGICK_CFLAGS=$IMAGEMAGICK_CFLAGS"
@@ -77,10 +79,25 @@ then
 fi
 AM_CONDITIONAL([WITH_ZLIB], [test $with_zlib = "yes"])
 
+AC_ARG_WITH(python, AS_HELP_STRING([--with-python], [add python support]), , with_python="no")
+if test $with_python != "no"
+then
+  AX_PYTHON_DEVEL()
+  if test $pythonexists = "yes"
+  then
+    AC_DEFINE([WITH_PYTHON], [1], [Use Python])
+    echo "PYTHON_CPPFLAGS=${PYTHON_CPPFLAGS}"
+    echo "PYTHON_LDFLAGS=${PYTHON_LDFLAGS}"
+    echo "PYTHON_EXTRA_LIBS=${PYTHON_EXTRA_LIBS}"
+    echo "PYTHON_EXTRA_LDFLAGS=${PYTHON_EXTRA_LDFLAGS}"
+  fi
+fi
+AM_CONDITIONAL([WITH_PYTHON], [test $pythonexists = "yes"])
+
 AC_CHECK_FUNC(register_printf_specifier, AC_DEFINE([USE_REGISTER_PRINTF_SPECIFIER], [1], [Use register_printf_specifier() instead of register_printf_function()]))
 
-AC_SUBST(NXWEB_EXT_LIBS, "$GNUTLS_LIBS $IMAGEMAGICK_LIBS $ZLIB_LIBS -lrt -lpthread")
-AC_SUBST(NXWEB_EXT_CFLAGS, "$GNUTLS_CFLAGS $IMAGEMAGICK_CFLAGS")
+AC_SUBST(NXWEB_EXT_LIBS, "$GNUTLS_LIBS $IMAGEMAGICK_LIBS $ZLIB_LIBS -lrt -lpthread $PYTHON_LDFLAGS")
+AC_SUBST(NXWEB_EXT_CFLAGS, "$GNUTLS_CFLAGS $IMAGEMAGICK_CFLAGS $PYTHON_CPPFLAGS")
 
 AC_SUBST(NXWEB_LIB_VERSION_INFO, "0:0:0")
 
@@ -97,5 +114,6 @@ AC_MSG_NOTICE([Summary of build options:
   SSL support:        $with_gnutls
   ImageMagick:        $with_imagemagick
   GZIP compression:   $with_zlib
+  Python integration: $pythonexists
   Shared lib version: $NXWEB_LIB_VERSION_INFO
 ])

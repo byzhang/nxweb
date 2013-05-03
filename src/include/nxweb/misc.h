@@ -20,6 +20,11 @@
 #ifndef MISC_H_INCLUDED
 #define MISC_H_INCLUDED
 
+#ifdef	__cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -32,8 +37,29 @@ int nxweb_run_daemon(const char* work_dir, const char* log_file, const char* pid
 int nxweb_run_normal(const char* work_dir, const char* log_file, const char* pid_file, void (*main_func)());
 int nxweb_drop_privileges(const char* group_name, const char* user_name);
 
+typedef struct nxweb_main_args_t {
+  int port;
+  int ssl_port;
+  const char* group_name;
+  const char* user_name;
+  const char* listening_interface_ip;
+} nxweb_main_args_t;
+
+extern nxweb_main_args_t nxweb_main_args;
+
+int nxweb_main_stub(int argc, char** argv, void (*server_main)());
+
 void nxweb_die(const char* fmt, ...) __attribute__((format (printf, 1, 2)));
 void nxweb_log_error(const char* fmt, ...) __attribute__((format (printf, 1, 2)));
+void nxweb_log_warning(const char* fmt, ...) __attribute__((format (printf, 1, 2)));
+void nxweb_log_info(const char* fmt, ...) __attribute__((format (printf, 1, 2)));
+
+#define NXWEB_LOG_NONE 0
+#define NXWEB_LOG_ERROR 1
+#define NXWEB_LOG_WARNING 2
+#define NXWEB_LOG_INFO 3
+
+extern int nxweb_error_log_level;
 
 int _nxweb_set_non_block(int fd);
 int _nxweb_setup_listening_socket(int fd);
@@ -86,5 +112,19 @@ static inline char* uint_to_hex_string_zeropad(unsigned long n, char* buf, int n
   }
   return buf;
 }
+
+static inline char* uint64_to_hex_string_zeropad(uint64_t n, char* buf, int num_digits, int null_terminate) {
+  char* p=buf+num_digits;
+  if (null_terminate) *p='\0';
+  while (num_digits--) {
+    *--p=HEX_DIGIT(n);
+    n>>=4;
+  }
+  return buf;
+}
+
+#ifdef	__cplusplus
+}
+#endif
 
 #endif // MISC_H_INCLUDED
