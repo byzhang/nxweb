@@ -18,6 +18,7 @@ ENDIF(NOT CMAKE_BUILD_TYPE)
 set (CMAKE_BUILD_TYPE "${CMAKE_BUILD_TYPE}" CACHE STRING "build type")
 SET (CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 
+find_package(BLAZE REQUIRED)
 find_package(Boost COMPONENTS system REQUIRED)
 find_package(GFlags REQUIRED)
 find_package(Glog REQUIRED)
@@ -25,6 +26,7 @@ find_package(Gperftools)
 find_library(NXWEB_LIBRARY NAMES libnxweb.a nxweb)
 
 include_directories(
+  ${BLAZE_INCLUDE_DIR}
   ${Boost_INCLUDE_DIR}
   ${NXWEB_SOURCE_DIR}
   ${GFLAGS_INCLUDE_DIRS}
