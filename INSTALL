@@ -8,7 +8,7 @@ cd nxweb-***
 *** - is the version number.
 0. Autoreconf
 If configure script doesn't exist yet,
-./autorecon -i
+autorecon -i
 
 1. Configure
 
