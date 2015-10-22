@@ -50,7 +50,7 @@ static volatile int shutdown_in_progress=0;
 static volatile int num_connections=0;
 
 uint16_t _nxweb_max_net_threads;
-nxweb_net_thread_data* _nxweb_net_threads;
+nxweb_net_thread_data* _nxweb_net_threads=NULL;
 int _nxweb_num_net_threads;
 __thread nxweb_net_thread_data* _nxweb_net_thread_data;
 
@@ -1125,6 +1125,8 @@ void nxweb_run(uint16_t max_net_threads) {
   pthread_mutex_destroy(&nxweb_server_config.access_log_start_mux);
 
   free(nxweb_server_config.work_dir);
+  free(_nxweb_net_threads);
+  _nxweb_net_threads=NULL;
 
   nxweb_log_error("end of nxweb_run()");
 }

@@ -41,7 +41,7 @@ static void show_help(void) {
 #endif
           " -c file  load configuration file (default: nxweb_config.json)\n"
           " -T targ  set configuration target\n"
-	  " -t num   set max number of threads\n"
+          " -t num   set max number of threads\n"
           " -P dir   set python root dir\n"
           " -W name  set python WSGI app fully qualified name\n"
           " -V path  set python virtualenv path\n"
