@@ -4,12 +4,13 @@
 #include <glog/logging.h>
 #include <google/gflags.h>
 #include <nxweb/nxweb.h>
+#include <sys/sysinfo.h>
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
-extern void handler_config_run();
+extern void handler_config_run(uint16_t max_net_threads);
 #ifdef __cplusplus
 }
 #endif
@@ -24,6 +25,12 @@ DEFINE_string(pid_file, "", "default pid in daemon mode");
 DEFINE_string(user_name, "", "");
 DEFINE_string(group_name, "", "");
 DEFINE_string(host_and_port, "0.0.0.0:8080", "it can be :8080");
+DEFINE_int32(threads, 0, "number of threads, default is 0 means automatically");
+
+extern "C" void config_run() {
+  LOG(ERROR) << "threads:" << FLAGS_threads;
+  handler_config_run(FLAGS_threads);
+}
 
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
@@ -50,18 +57,22 @@ int main(int argc, char** argv) {
 
   nxweb_main_args.http_listening_host_and_port=FLAGS_host_and_port.c_str();
 
+  if (FLAGS_threads <= 0) {
+    FLAGS_threads = (get_nprocs() - 1) / 2 + 1;
+  }
+
   if (FLAGS_daemon) {
     nxweb_server_config.error_log_fpath=(FLAGS_error_log_file.empty()? "error_log": FLAGS_error_log_file.c_str());
     nxweb_run_daemon(FLAGS_work_dir.c_str(),
                      nxweb_server_config.error_log_fpath,
                      FLAGS_pid_file.empty()? "pid": FLAGS_pid_file.c_str(),
-                     handler_config_run, nxweb_main_args.group_gid, nxweb_main_args.user_uid);
+                     config_run, nxweb_main_args.group_gid, nxweb_main_args.user_uid);
   } else {
     nxweb_server_config.error_log_fpath=(FLAGS_error_log_file.empty()? nullptr: FLAGS_error_log_file.c_str());
     nxweb_run_normal(FLAGS_work_dir.c_str(),
                      nxweb_server_config.error_log_fpath,
                      FLAGS_pid_file.empty()? nullptr: FLAGS_pid_file.c_str(),
-                     handler_config_run, nxweb_main_args.group_gid, nxweb_main_args.user_uid);
+                     config_run, nxweb_main_args.group_gid, nxweb_main_args.user_uid);
   }
   return EXIT_SUCCESS;
 }

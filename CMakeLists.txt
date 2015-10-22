@@ -133,6 +133,7 @@ include_directories("${PROJECT_BINARY_DIR}")
 add_subdirectory(src/lib)
 add_subdirectory(src/bin)
 add_subdirectory(sample_config)
+add_subdirectory(examples/openmp)
 
 
 install(FILES "sample_config/python/nxwebpy.py" DESTINATION lib/nxweb)

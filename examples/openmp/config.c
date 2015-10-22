@@ -9,7 +9,7 @@
 NXWEB_DEFINE_HANDLER(compute_handler, .on_request = compute,
                      .flags = NXWEB_HANDLE_ANY | NXWEB_PARSE_PARAMETERS);
 
-void handler_config_run()
+void handler_config_run(uint16_t max_net_threads)
 {
   // Bind listening interfaces:
   if (nxweb_listen(nxweb_main_args.http_listening_host_and_port, 4096)) return;
@@ -20,6 +20,6 @@ void handler_config_run()
   NXWEB_HANDLER_SETUP(compute, "/compute", compute_handler, .priority = 100);
 
   // Go!
-  nxweb_run();
+  nxweb_run(max_net_threads);
 }
 
