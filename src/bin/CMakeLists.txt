@@ -9,7 +9,7 @@ include_directories(../include ${EXTRA_INCLUDES})
 add_compile_options(-pthread)
 
 add_executable(nxweb_exe ${EXE_SOURCE_FILES})
-target_link_libraries(nxweb_exe nxweb_so pthread ${EXTRA_LIBS})
+target_link_libraries(nxweb_exe nxweb_so pthread ${EXTRA_LIBS} dl)
 set_target_properties(nxweb_exe PROPERTIES OUTPUT_NAME nxweb)
 
 install(TARGETS nxweb_exe DESTINATION bin)

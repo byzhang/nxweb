@@ -44,12 +44,12 @@ add_library(nxweb_so SHARED ${LIB_SOURCE_FILES})
 set_target_properties(nxweb_so PROPERTIES SOVERSION 0.0.0)
 set_target_properties(nxweb_so PROPERTIES OUTPUT_NAME nxweb)
 
-# add_library(nxweb_static STATIC ${LIB_SOURCE_FILES})
-# set_target_properties(nxweb_static PROPERTIES OUTPUT_NAME nxweb)
+add_library(nxweb_static STATIC ${LIB_SOURCE_FILES})
+set_target_properties(nxweb_static PROPERTIES OUTPUT_NAME nxweb)
 
 
 install(TARGETS nxweb_so DESTINATION lib)
-# install(TARGETS nxweb_static DESTINATION lib)
+install(TARGETS nxweb_static DESTINATION lib)
 install(DIRECTORY ../include/nxweb DESTINATION include FILES_MATCHING PATTERN "*.h")
 
 add_subdirectory(pkgconfig)
