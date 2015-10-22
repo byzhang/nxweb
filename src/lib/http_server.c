@@ -49,7 +49,8 @@ static pthread_t main_thread_id=0;
 static volatile int shutdown_in_progress=0;
 static volatile int num_connections=0;
 
-nxweb_net_thread_data _nxweb_net_threads[NXWEB_MAX_NET_THREADS];
+uint16_t _nxweb_max_net_threads;
+nxweb_net_thread_data* _nxweb_net_threads=NULL;
 int _nxweb_num_net_threads;
 __thread nxweb_net_thread_data* _nxweb_net_thread_data;
 
@@ -991,15 +992,18 @@ int nxweb_setup_http_proxy_pool(int idx, const char* host_and_port) {
   return !!nxweb_server_config.http_proxy_pool_config[idx].saddr;
 }
 
-void nxweb_run() {
+void nxweb_run(uint16_t max_net_threads) {
   int i;
+
+  _nxweb_max_net_threads=max_net_threads;
+  _nxweb_net_threads=malloc(_nxweb_max_net_threads*sizeof(nxweb_net_thread_data));
 
   nxweb_server_config.work_dir=getcwd(0, 0);
 
   pid_t pid=getpid();
   main_thread_id=pthread_self();
   _nxweb_num_net_threads=(int)sysconf(_SC_NPROCESSORS_ONLN);
-  if (_nxweb_num_net_threads>NXWEB_MAX_NET_THREADS) _nxweb_num_net_threads=NXWEB_MAX_NET_THREADS;
+  if (_nxweb_num_net_threads>_nxweb_max_net_threads) _nxweb_num_net_threads=_nxweb_max_net_threads;
 
   pthread_mutex_init(&nxweb_server_config.access_log_start_mux, 0);
   nxweb_access_log_restart();
@@ -1121,6 +1125,8 @@ void nxweb_run() {
   pthread_mutex_destroy(&nxweb_server_config.access_log_start_mux);
 
   free(nxweb_server_config.work_dir);
+  free(_nxweb_net_threads);
+  _nxweb_net_threads=NULL;
 
   nxweb_log_error("end of nxweb_run()");
 }

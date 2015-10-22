@@ -41,6 +41,7 @@ static void show_help(void) {
 #endif
           " -c file  load configuration file (default: nxweb_config.json)\n"
           " -T targ  set configuration target\n"
+          " -t num   set max number of threads\n"
           " -P dir   set python root dir\n"
           " -W name  set python WSGI app fully qualified name\n"
           " -V path  set python virtualenv path\n"
@@ -90,8 +91,9 @@ int nxweb_main_stub(int argc, char** argv, void (*server_main)()) {
   const char* access_log_file=0;
   const char* pid_file=0;
 
+  nxweb_main_args.max_net_threads = NXWEB_MAX_NET_THREADS;
   int c;
-  while ((c=getopt(argc, argv, ":hvdsw:l:a:p:u:g:H:S:c:T:P:W:V:L:M:"))!=-1) {
+  while ((c=getopt(argc, argv, ":hvdsw:l:a:p:u:g:H:S:c:T:t:P:W:V:L:M:"))!=-1) {
     switch (c) {
       case 'h':
         show_help();
@@ -160,6 +162,17 @@ int nxweb_main_stub(int argc, char** argv, void (*server_main)()) {
           }
         }
         break;
+      case 't':
+	{
+	  char* end;
+	  long val = strtol(optarg, &end, 10);
+	  if (*end || val <= 0 || val > UINT16_MAX) {
+	    fprintf(stderr, "bad value for max net threads: %s\n", optarg);
+	    return EXIT_FAILURE;
+	  }
+          nxweb_main_args.max_net_threads = val;
+	}
+        break;
       case 'P':
         nxweb_main_args.python_root=optarg;
         break;
@@ -177,7 +190,7 @@ int nxweb_main_stub(int argc, char** argv, void (*server_main)()) {
         break;
       case '?':
       default:
-        fprintf(stderr, "unkown option: -%c\n\n", optopt);
+        fprintf(stderr, "unknown option: -%c\n\n", optopt);
         show_help();
         return EXIT_FAILURE;
     }

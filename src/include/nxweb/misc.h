@@ -53,6 +53,7 @@ typedef struct nxweb_main_args_t {
   const char* python_virtualenv_path;
   gid_t group_gid;
   uid_t user_uid;
+  uint16_t max_net_threads;
   _Bool error_log_level_set:1;
 } nxweb_main_args_t;
 

@@ -24,7 +24,7 @@
 
 static void server_config() {
   if (nxweb_load_config(nxweb_main_args.config_file)==-1) return;
-  nxweb_run();
+  nxweb_run(nxweb_main_args.max_net_threads);
 }
 
 #else // not NO_JSON_CONFIG
@@ -130,7 +130,7 @@ static void server_config() {
   //nxweb_set_timeout(NXWEB_TIMER_KEEP_ALIVE, 120000000); // micro-seconds
 
   // Go!
-  nxweb_run();
+  nxweb_run(nxweb_main_args.max_net_threads);
 }
 
 #endif // NO_JSON_CONFIG
